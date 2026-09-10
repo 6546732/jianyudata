@@ -6,3 +6,9 @@ browser_profile/
 downloads/
 *.log
 run.lock
+one_day_*.json
+one_day*.lock
+one_day_error_*.png
+*_diagnostic.json
+*_diagnostic.html
+jan01_practice_submitted.txt
