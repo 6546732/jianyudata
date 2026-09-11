@@ -26,9 +26,12 @@ class ExportRange:
     notifier.send(record)：发送超额通知；失败记录到持久化发件箱。
     """
     def __init__(self, backend, base, start='2025-01-01', end=None, confirm=False,
-                 today=china_today, notifier=None):
+                 today=china_today, notifier=None, daily_limit=200):
         self.backend, self.today, self.confirm = backend, today, confirm
         self.notifier = notifier
+        if type(daily_limit) is not int or not 1 <= daily_limit <= 800:
+            raise ValueError('daily_limit必须为1至800的整数')
+        self.daily_limit = daily_limit
         self.base = Path(base)
         self.base.mkdir(parents=True, exist_ok=True)
         self.path = self.base / 'range_progress.json'
@@ -112,8 +115,11 @@ class ExportRange:
                     raise RuntimeError('无法读取当日实际剩余额度')
                 if self.today().isoformat() != quota_day:
                     continue
-                remaining = (min(balance, self.state['remaining'])
-                             if self.state['quota_day'] == quota_day else balance)
+                used = sum(p['count'] for p in self.state['completed']
+                           if p.get('quota_day') == quota_day)
+                allowance = max(0, self.daily_limit - used)
+                remaining = (min(balance, allowance, self.state['remaining'])
+                             if self.state['quota_day'] == quota_day else min(balance, allowance))
                 self.state.update(quota_day=quota_day, remaining=remaining)
                 checked_day = quota_day
                 self.save()
@@ -167,7 +173,9 @@ class ExportRange:
                 selected.append(item)
                 count += item['count']
             if not selected:
-                return self.stop('waiting_quota')
+                # 200条自定上限不是网站800条硬限制，不能据此永久跳过省份。
+                return self.stop('needs_finer_split' if queue[0]['count'] > self.daily_limit
+                                 else 'waiting_quota')
             regions = [i['region'] for i in selected if i['region'] is not None]
             if self.count(regions) != count:
                 raise RuntimeError('合并查询条数变化或地区重叠，未提交；请核对当前队列')

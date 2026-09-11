@@ -22,7 +22,7 @@ from selenium.common.exceptions import (
 FILTER_URL = ('https://www.jianyu360.cn/page_workDesktop/work-bench/page'
               '?link=https%3A%2F%2Fwww.jianyu360.cn%2Ffront%2FdataExport%2FtoSieve')
 WORDS = {'超融合', '分布式存储', '私有云', '虚拟化'}
-VERSION = '2026-09-10-range-v1'
+VERSION = '2026-09-11-range-prefix-100-v2'
 
 
 def calendar_month(text):
@@ -64,9 +64,30 @@ def xlsx_rows(path):
             raise ValueError('没有工作表')
         root = ET.fromstring(archive.read(sheets[0]))
         ns = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
-        return sum(1 for row in root.findall('.//s:sheetData/s:row', ns)
+        rows = root.findall('.//s:sheetData/s:row', ns)
+        total = sum(1 for row in rows
                    if any(c.find('s:v', ns) is not None or c.find('s:is', ns) is not None
                           for c in row.findall('s:c', ns)))
+        # 高级字段包已现场确认使用两行表头；统一返回“数据行+1”。
+        strings = []
+        if 'xl/sharedStrings.xml' in archive.namelist():
+            strings = [''.join(e.itertext()) for e in ET.fromstring(
+                archive.read('xl/sharedStrings.xml')).findall('s:si', ns)]
+        def values(row):
+            result = []
+            for cell in row.findall('s:c', ns):
+                v = cell.find('s:v', ns)
+                if v is not None and v.text is not None:
+                    result.append(strings[int(v.text)] if cell.get('t') == 's' else v.text)
+                inline = cell.find('s:is', ns)
+                if inline is not None:
+                    result.append(''.join(inline.itertext()))
+            return result
+        if len(rows) >= 2:
+            first, second = values(rows[0]), values(rows[1])
+            if '采购单位信息' in first and '单位名称' in second and '联系人' in second:
+                total -= 1
+        return total
 
 
 class OneDay:
@@ -102,6 +123,13 @@ class OneDay:
         # 已由现场诊断确认：底部栏含数量、修改条件和正式导出按钮。
         footers = [e for e in self.driver.find_elements(By.CSS_SELECTOR, '.data-footer-main')
                    if e.is_displayed()]
+        if len(footers) > 1:
+            # 现场确认顶部/底部两个完全相同的结果栏；先核对所有副本条数一致。
+            for footer in footers:
+                nums = footer.find_elements(By.CSS_SELECTOR, '.dataExNum')
+                if len(nums) != 1 or nums[0].text.strip() != str(self.state['count']):
+                    raise RuntimeError('多个结果栏数量不一致，停止。')
+            footers = [footers[-1]]
         if len(footers) == 1:
             footer = footers[0]
             counts = [e for e in footer.find_elements(By.CSS_SELECTOR, '.dataExNum') if e.is_displayed()]
@@ -204,7 +232,7 @@ class OneDay:
             return
         raise RuntimeError('未找到与重置同组的确定按钮，未提交查询。')
 
-    def find_page(self, predicate, timeout=25):
+    def find_page(self, predicate, timeout=25, window_filter=None):
         """重新枚举窗口及 iframe，避免沿用已关闭窗口；不导航、不提交。"""
         def walk(depth=0):
             if predicate():
@@ -219,10 +247,18 @@ class OneDay:
             return False
 
         def probe(_):
-            for handle in list(self.driver.window_handles):
+            handles = list(self.driver.window_handles)
+            try:
+                current = self.driver.current_window_handle
+                handles = [current] + [h for h in handles if h != current]
+            except NoSuchWindowException:
+                pass
+            for handle in handles:
                 try:
                     self.driver.switch_to.window(handle)
                     self.driver.switch_to.default_content()
+                    if window_filter is not None and not window_filter(handle):
+                        continue
                     if walk():
                         return True
                 except (NoSuchWindowException, StaleElementReferenceException):
@@ -337,7 +373,7 @@ class OneDay:
         target = date.fromisoformat(self.day)
         element.click()
         try:
-            self.find_frame_here(lambda: any(e.is_displayed() for e in self.driver.find_elements(By.CSS_SELECTOR, '.WdateDiv')), timeout=3)
+            self.find_frame_here(lambda: any(e.is_displayed() for e in self.driver.find_elements(By.CSS_SELECTOR, '.WdateDiv')), timeout=10)
         except TimeoutException:
             self.restore_date_frame()
         else:
@@ -473,8 +509,38 @@ class OneDay:
         if not 0 < count <= 800:
             raise RuntimeError('只能为1至800条创建结算预览')
         print(f'查询显示 {count} 条，进入订单页核对。', flush=True)
+        source = self.driver.current_window_handle
+        before = {}
+        for handle in list(self.driver.window_handles):
+            try:
+                self.driver.switch_to.window(handle)
+                before[handle] = self.driver.current_url
+            except NoSuchWindowException:
+                continue
+        self.driver.switch_to.window(source)
+        # 枚举窗口会丢失iframe上下文，恢复本次查询所在frame，不跳到旧页面。
+        self.find_frame_here(lambda: bool(re.search(
+            rf'为您筛选到\s*{count}\s*条数据', self.body())))
         self.export_entry()
-        self.find_page(lambda: '选择支付方式' in self.body())
+
+        def new_order_window(handle):
+            return (handle == source or handle not in before
+                    or self.driver.current_url != before[handle])
+
+        def expected_order():
+            text = self.body()
+            url = self.driver.execute_script('return location.href')
+            counts = re.findall(r'已选择\s*(\d+)\s*条数据', text)
+            return ('/front/dataExport/toCreateOrderPage/' in url
+                    and '选择支付方式' in text and counts == [str(count)])
+
+        try:
+            self.find_page(expected_order, timeout=30, window_filter=new_order_window)
+        except TimeoutException:
+            raise RuntimeError(f'未找到本次新开的{count}条订单页，未选择旧订单、未确认扣除。')
+        self._order_window = self.driver.current_window_handle
+        self._order_frame_url = self.driver.execute_script('return location.href')
+        print(f'已锁定本次订单页：{count}条', flush=True)
         self.text_click('单日限量数据包')
         WebDriverWait(self.driver, 15).until(lambda _: '本次扣除' in self.body())
         # 附件中的真实协议 DOM：仅点击方框，禁止点协议链接。
@@ -488,7 +554,14 @@ class OneDay:
         WebDriverWait(self.driver, 5).until(lambda _: checkbox.is_selected())
 
     def verify(self):
+        if (hasattr(self, '_order_window') and
+                (self.driver.current_window_handle != self._order_window or
+                 self.driver.execute_script('return location.href') != self._order_frame_url)):
+            raise RuntimeError('当前窗口已不是本次锁定订单，禁止扣除。')
         text = self.body()
+        chosen = re.findall(r'已选择\s*(\d+)\s*条数据', text)
+        if chosen != [str(self.state['count'])]:
+            raise RuntimeError('订单页顶部所选条数与本批次不同，禁止扣除。')
         cards = [e for e in self.driver.find_elements(By.CSS_SELECTOR, '.spec-card.active') if e.is_displayed()]
         if len(cards) != 1 or '单日限量数据包' not in cards[0].text:
             raise RuntimeError('支付方式不是单日限量数据包。')

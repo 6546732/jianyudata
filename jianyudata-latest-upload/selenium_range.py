@@ -6,6 +6,7 @@ from pathlib import Path
 from export_one_day import OneDay, FILTER_URL, xlsx_rows
 from export_range import ExportRange
 from email_notice import SMTPNotifier
+from automatic_ui import AutomaticUI, DeferredNotifier
 
 
 class InteractiveUI:
@@ -33,17 +34,42 @@ class InteractiveUI:
 class SeleniumBackend:
     def __init__(self, driver, base, ui=None):
         self.driver, self.base = driver, Path(base)
-        self.ui = ui or InteractiveUI()
+        self.ui = ui or AutomaticUI()
         self.job, self.selection = None, None
+        self.balance_day = '2025-01-03'
 
     def balance(self):
-        return self.ui.balance(self.driver)
+        if not isinstance(self.ui, AutomaticUI):
+            return self.ui.balance(self.driver)
+        # 新建订单预览读取实时余额，不使用昨天停留页面中的旧余额。
+        day = self.balance_day
+        count = self.query(day, [])
+        if not 0 < count <= 800:
+            for region in self.regions(day):
+                count = self.query(day, [region])
+                if 0 < count <= 800:
+                    break
+            else:
+                raise RuntimeError('无法生成可读余额的免费额度预览，未提交。')
+        self.job.open_order()
+        balances = re.findall(r'今日限量余额\s*[:：]?\s*(\d+)\s*条', self.job.body())
+        if len(balances) != 1:
+            raise RuntimeError('本次余额预览页条数不唯一')
+        return int(balances[0])
 
     def existing_day(self, day):
         path = self.base / f'one_day_{day}.json'
         if not path.exists():
             return None
         state = json.loads(path.read_text(encoding='utf-8'))
+        if state.get('status') == 'submitted' and state.get('download_dir'):
+            candidates = list(Path(state['download_dir']).glob('*.xlsx'))
+            valid = [p for p in candidates if xlsx_rows(p) == state['count'] + 1]
+            if len(valid) == 1:
+                state.update(status='downloaded', file=str(valid[0]))
+                temp = path.with_suffix('.tmp')
+                temp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
+                temp.replace(path)
         if state.get('status') in {'submitting', 'submitted'}:
             raise RuntimeError(f'{day} 存在旧版未完成订单，请先恢复原下载，不再扣额')
         if state.get('status') != 'downloaded':
@@ -56,10 +82,12 @@ class SeleniumBackend:
         return self.ui.regions(self.driver, day)
 
     def query(self, day, regions):
-        self.driver.switch_to.default_content()
-        self.driver.get(FILTER_URL)
-        job = OneDay(self.driver, day, self.base / 'batch_state', False)
-        job.state_path = self.base / 'batch_state' / 'preview.json'
+        # 同一天复用筛选页，省份查询不再反复导航或进入订单页。
+        if self.job is not None and self.job.day == day:
+            job = self.job
+        else:
+            job = OneDay(self.driver, day, self.base / 'batch_state', False)
+            job.state_path = self.base / 'batch_state' / 'preview.json'
         self.job, self.selection = job, (day, list(regions))
         return job.query_filters(lambda j: self.ui.select_regions(j, regions), self.ui.wait_query)
 
@@ -114,12 +142,14 @@ class SeleniumBackend:
 
 
 def export_range(driver, base=r'D:\桌面\data', start='2025-01-01', end=None,
-                 confirm=False, ui=None, notifier=None):
+                 confirm=False, ui=None, notifier=None, daily_limit=200):
     """end=None：本次运行当天；每日重新调用即从原进度继续。"""
     if confirm and notifier is None:
-        notifier = SMTPNotifier.from_env()
-    return ExportRange(SeleniumBackend(driver, base, ui), base, start, end,
-                       confirm, notifier=notifier).run()
+        notifier = DeferredNotifier()
+    backend = SeleniumBackend(driver, base, ui)
+    backend.balance_day = start
+    return ExportRange(backend, base, start, end,
+                       confirm, notifier=notifier, daily_limit=daily_limit).run()
 
 
 def run_daily(driver, **kwargs):

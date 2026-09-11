@@ -62,7 +62,23 @@ class RangeTests(unittest.TestCase):
 
     def run_job(self, backend, end='2025-01-01', confirm=True):
         return ExportRange(backend, self.base, end=end, confirm=confirm,
-                           today=lambda: self.day, notifier=self.mail).run()
+                           today=lambda: self.day, notifier=self.mail, daily_limit=800).run()
+
+    def test_custom_200_limit(self):
+        backend = Backend(self.base, {'2025-01-01': {'安徽': 120, '北京': 110}})
+        state = ExportRange(backend, self.base, end='2025-01-01', confirm=True,
+                            today=lambda: self.day, notifier=self.mail).run()
+        self.assertEqual([x[2] for x in backend.submissions], [120])
+        self.assertEqual(state['remaining'], 80)
+        self.assertEqual(state['status'], 'waiting_quota')
+
+    def test_custom_limit_cannot_fit_province(self):
+        backend = Backend(self.base, {'2025-01-01': {'安徽': 223}})
+        state = ExportRange(backend, self.base, end='2025-01-01', confirm=True,
+                            today=lambda: self.day, notifier=self.mail).run()
+        self.assertEqual(state['status'], 'needs_finer_split')
+        self.assertEqual(backend.submissions, [])
+        self.assertEqual(state['skipped'], [])
 
     def test_whole_days_accumulate_then_resume(self):
         backend = Backend(self.base, {'2025-01-01': {'安徽': 300}, '2025-01-02': {'北京': 500}})
