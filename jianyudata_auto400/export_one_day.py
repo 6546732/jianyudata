@@ -255,10 +255,10 @@ class OneDay:
                 pass
             for handle in handles:
                 try:
-                    self.driver.switch_to.window(handle)
-                    self.driver.switch_to.default_content()
                     if window_filter is not None and not window_filter(handle):
                         continue
+                    self.driver.switch_to.window(handle)
+                    self.driver.switch_to.default_content()
                     if walk():
                         return True
                 except (NoSuchWindowException, StaleElementReferenceException):
@@ -268,16 +268,41 @@ class OneDay:
 
     def filter_page(self):
         predicate = lambda: '筛选日期' in self.body() and '关键词匹配方式' in self.body()
+        handle = getattr(self.driver, '_jianyu_filter_handle', None)
+        if handle not in self.driver.window_handles:
+            # 首次接入只查找已有筛选页，不创建标签页。
+            try:
+                self.find_page(predicate, timeout=15)
+                self.driver._jianyu_filter_handle = self.driver.current_window_handle
+                return
+            except TimeoutException:
+                handle = self.driver.current_window_handle
+        self.driver._jianyu_filter_handle = handle
+        self.driver.switch_to.window(handle)
+        self.driver.switch_to.default_content()
         try:
-            self.find_page(predicate, timeout=3)
+            self.find_page(predicate, timeout=15, window_filter=lambda h: h == handle)
         except TimeoutException:
-            handles = self.driver.window_handles
-            if not handles:
-                raise RuntimeError('Chrome 没有可用标签页，请重新连接。')
-            self.driver.switch_to.window(handles[-1])
-            self.driver.switch_to.new_window('tab')
+            self.driver.switch_to.window(handle)
             self.driver.get(FILTER_URL)
-            self.find_page(predicate)
+            self.find_page(predicate, timeout=30, window_filter=lambda h: h == handle)
+
+    def release_order_tab(self):
+        """仅在预览结束或下载校验成功后关闭本次新建订单标签页。"""
+        order = getattr(self, '_order_window', None)
+        source = getattr(self, '_order_source', None)
+        try:
+            handles = self.driver.window_handles
+            if (getattr(self, '_order_created', False) and order in handles
+                    and source in handles and order != source):
+                self.driver.switch_to.window(order)
+                self.driver.close()
+            if source in self.driver.window_handles:
+                self.driver.switch_to.window(source)
+                self.driver.switch_to.default_content()
+        except Exception as error:
+            # 清理失败不改变已完成下载状态，也不触发重新扣除。
+            print('临时订单页未清理，请手动关闭：', type(error).__name__)
 
     def date_inputs(self):
         candidates = []
@@ -523,22 +548,15 @@ class OneDay:
             raise RuntimeError('只能为1至800条创建结算预览')
         print(f'查询显示 {count} 条，进入订单页核对。', flush=True)
         source = self.driver.current_window_handle
-        before = {}
-        for handle in list(self.driver.window_handles):
-            try:
-                self.driver.switch_to.window(handle)
-                before[handle] = self.driver.current_url
-            except NoSuchWindowException:
-                continue
-        self.driver.switch_to.window(source)
+        before = set(self.driver.window_handles)
+        self._order_source = source
         # 枚举窗口会丢失iframe上下文，恢复本次查询所在frame，不跳到旧页面。
         self.find_frame_here(lambda: bool(re.search(
             rf'为您筛选到\s*{count}\s*条数据', self.body())))
         self.export_entry()
 
         def new_order_window(handle):
-            return (handle == source or handle not in before
-                    or self.driver.current_url != before[handle])
+            return (handle == source or handle not in before)
 
         def expected_order():
             text = self.body()
@@ -552,6 +570,7 @@ class OneDay:
         except TimeoutException:
             raise RuntimeError(f'未找到本次新开的{count}条订单页，未选择旧订单、未确认扣除。')
         self._order_window = self.driver.current_window_handle
+        self._order_created = self._order_window not in before
         self._order_frame_url = self.driver.execute_script('return location.href')
         print(f'已锁定本次订单页：{count}条', flush=True)
         self.text_click('单日限量数据包')

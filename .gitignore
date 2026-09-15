@@ -12,3 +12,13 @@ one_day_error_*.png
 *_diagnostic.json
 *_diagnostic.html
 jan01_practice_submitted.txt
+mail_credential.xml
+*credential*.xml
+.env
+.env.*
+logs/
+batch_state/
+range_progress.json
+daily_scheduler.lock
+backup-*/
+*.backup-*

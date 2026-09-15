@@ -55,7 +55,9 @@ class SeleniumBackend:
         balances = re.findall(r'今日限量余额\s*[:：]?\s*(\d+)\s*条', self.job.body())
         if len(balances) != 1:
             raise RuntimeError('本次余额预览页条数不唯一')
-        return int(balances[0])
+        balance = int(balances[0])
+        self.job.release_order_tab()
+        return balance
 
     def existing_day(self, day):
         path = self.base / f'one_day_{day}.json'
@@ -101,6 +103,7 @@ class SeleniumBackend:
         balance = int(balances[0])
         if balance < count:
             # 不足额度的预览不提交，交给调度器缩小地区范围。
+            self.job.release_order_tab()
             return balance, count
         actual_count, balance, _ = self.job.verify()
         return balance, actual_count
@@ -116,7 +119,9 @@ class SeleniumBackend:
                  download_dir=str(folder.resolve()), status='prepared')
         self.driver.execute_cdp_cmd('Browser.setDownloadBehavior', {
             'behavior': 'allow', 'downloadPath': str(folder.resolve())})
-        return job.submit_order()
+        file = job.submit_order()
+        job.release_order_tab()
+        return file
 
     def recover(self, pending):
         path = self.base / 'batch_state' / f"{pending['batch_id']}.json"
