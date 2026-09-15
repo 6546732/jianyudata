@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from urllib.request import ProxyHandler, build_opener
 
+PERSISTENT_CHROME_TASK = 'Jianyu-Automation-Chrome'
+
 
 def flag(command, name):
     match = re.search(r'--' + re.escape(name) + r'(?:=|\s+)(?:"([^"]*)"|(\S+))', command or '')
@@ -95,18 +97,28 @@ def connect_browser(chrome, base, existing=None):
         if profile is None:
             raise RuntimeError('两个自动化配置目录均被占用，且调试连接不可用。请保存工作并关闭旧自动化 Chrome 窗口后重试；程序不会强制关闭浏览器。')
         profile.mkdir(parents=True, exist_ok=True)
-        print('启动 Chrome：', profile, '（新配置目录需要重新登录）')
-        process = subprocess.Popen([
-            str(chrome), '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1',
-            f'--user-data-dir={profile.resolve()}', '--no-first-run', '--no-default-browser-check',
-            'https://www.jianyu360.cn/'
-        ])
+        print('启动常驻 Chrome：', profile, '（独立于本次导出任务）')
+        process = None
+        if profile == profiles[0]:
+            started = subprocess.run(
+                ['schtasks.exe', '/Run', '/TN', PERSISTENT_CHROME_TASK],
+                capture_output=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)).returncode == 0
+        else:
+            started = False
+        if not started:
+            process = subprocess.Popen([
+                str(chrome), '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1',
+                f'--user-data-dir={profile.resolve()}', '--no-first-run', '--no-default-browser-check',
+                'https://www.jianyu360.cn/'
+            ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+               creationflags=(getattr(subprocess, 'DETACHED_PROCESS', 0)
+                              | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)))
         deadline = time.monotonic() + 40
         while time.monotonic() < deadline:
             port = active_port(profile)
             if port and endpoint(port):
                 break
-            if process.poll() is not None:
+            if process is not None and process.poll() is not None:
                 raise RuntimeError('Chrome 启动进程已退出，可能被已有窗口接管或被系统阻止。未执行导出。')
             time.sleep(0.3)
         else:

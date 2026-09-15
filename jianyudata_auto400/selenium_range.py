@@ -2,6 +2,7 @@
 import json
 import re
 from pathlib import Path
+from selenium.webdriver.common.by import By
 
 from export_one_day import OneDay, FILTER_URL, xlsx_rows
 from export_range import ExportRange
@@ -36,6 +37,7 @@ class SeleniumBackend:
         self.driver, self.base = driver, Path(base)
         self.ui = ui or AutomaticUI()
         self.job, self.selection = None, None
+        self.last_order_check = None
         self.balance_day = '2025-01-03'
 
     def balance(self):
@@ -51,12 +53,29 @@ class SeleniumBackend:
                     break
             else:
                 raise RuntimeError('无法生成可读余额的免费额度预览，未提交。')
-        self.job.open_order()
-        balances = re.findall(r'今日限量余额\s*[:：]?\s*(\d+)\s*条', self.job.body())
-        if len(balances) != 1:
-            raise RuntimeError('本次余额预览页条数不唯一')
-        balance = int(balances[0])
-        self.job.release_order_tab()
+        self.job.open_order(prepare_payment=False)
+        try:
+            # 订单页可能默认选中“个人支付”。余额只在免费包选中后可靠显示；
+            # 这里仅切换选项并读取数字，绝不勾协议或点击确认扣除。
+            self.job.text_click('单日限量数据包')
+            from selenium.webdriver.support.ui import WebDriverWait
+            WebDriverWait(self.driver, 15).until(
+                lambda _: '今日限量余额' in self.job.body())
+            balances = re.findall(r'今日限量余额\s*[:：]?\s*(\d+)\s*条', self.job.body())
+            distinct = {int(value) for value in balances}
+            if len(distinct) != 1:
+                raise RuntimeError(f'余额预览值缺失或互相矛盾：{balances}')
+            balance = distinct.pop()
+            acknowledgements = [e for e in self.driver.find_elements(
+                By.XPATH,
+                "//*[self::button or self::span][normalize-space(.)='我知道了']")
+                if e.is_displayed()]
+            if len(acknowledgements) > 1:
+                raise RuntimeError('余额不足提示的关闭按钮不唯一')
+            if acknowledgements:
+                self.job.visible_click(acknowledgements[0])
+        finally:
+            self.job.release_order_tab()
         return balance
 
     def existing_day(self, day):
@@ -94,18 +113,37 @@ class SeleniumBackend:
         return job.query_filters(lambda j: self.ui.select_regions(j, regions), self.ui.wait_query)
 
     def prepare(self, day, regions, count):
+        self.last_order_check = None
         if self.selection != (day, list(regions)) or self.job.state.get('count') != count:
             raise RuntimeError('结算与最后一次查询条件不符')
         self.job.open_order()
         balances = re.findall(r'今日限量余额\s*[:：]?\s*(\d+)\s*条', self.job.body())
-        if len(balances) != 1:
-            raise RuntimeError('订单的实际余额不唯一')
-        balance = int(balances[0])
+        distinct = {int(value) for value in balances}
+        if len(distinct) != 1:
+            raise RuntimeError(f'订单余额值缺失或互相矛盾：{balances}')
+        balance = distinct.pop()
         if balance < count:
             # 不足额度的预览不提交，交给调度器缩小地区范围。
+            self.last_order_check = {
+                'date': day, 'regions': list(regions), 'count': count,
+                'today_balance': balance, 'after_export': None,
+                'allowed': False, 'reason': 'insufficient_balance'}
+            print(f'提交前额度核对：本次扣除{count}条；今日限量余额{balance}条；'
+                  '本日仍可导出无法生成；不允许导出，重新拆分。', flush=True)
             self.job.release_order_tab()
             return balance, count
-        actual_count, balance, _ = self.job.verify()
+        actual_count, balance, after = self.job.verify()
+        allowed = (actual_count == count and actual_count <= balance
+                   and after == balance - actual_count)
+        self.last_order_check = {
+            'date': day, 'regions': list(regions), 'count': actual_count,
+            'today_balance': balance, 'after_export': after,
+            'allowed': allowed, 'reason': 'verified' if allowed else 'inconsistent'}
+        decision = '允许导出' if allowed else '禁止导出'
+        print(f'提交前额度核对：本次扣除{actual_count}条；今日限量余额{balance}条；'
+              f'本日仍可导出{after}条；{decision}', flush=True)
+        if not allowed:
+            raise RuntimeError('最终订单额度核对不一致，禁止提交')
         return balance, actual_count
 
     def submit(self, batch_id):

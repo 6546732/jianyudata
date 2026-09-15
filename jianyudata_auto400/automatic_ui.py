@@ -55,7 +55,8 @@ class AutomaticUI:
         self.arm_query(job)
 
     def arm_query(self, job):
-        # 只观察已确认的筛选请求，不发送额外API请求。
+        # 同时观察请求和结果区域变化。部分页面请求不会经过 XMLHttpRequest，
+        # 此时用结果区 DOM 更新作为后备信号，避免把已完成查询误判为超时。
         job.driver.execute_script('''
         if (!window.__autoQueryInstalled) {
           window.__autoQueryInstalled=true;
@@ -73,6 +74,16 @@ class AutomaticUI:
           };
         }
         window.__autoQuery={done:0,status:0,finished:0,pending:0};
+        if (window.__autoResultObserver) window.__autoResultObserver.disconnect();
+        window.__autoResultMutation={count:0,last:0};
+        const resultRoot=document.querySelector('#dataExport_main') || document.body;
+        window.__autoResultObserver=new MutationObserver((items)=>{
+          if(items.length) {
+            window.__autoResultMutation.count+=items.length;
+            window.__autoResultMutation.last=Date.now();
+          }
+        });
+        window.__autoResultObserver.observe(resultRoot,{subtree:true,childList:true,characterData:true,attributes:true});
         ''')
 
     def wait_query(self, job):
@@ -80,8 +91,20 @@ class AutomaticUI:
             q=job.driver.execute_script('return window.__autoQuery')
             if q and q['done'] and q['status'] != 200:
                 raise RuntimeError('本次筛选请求失败，未读取旧结果。')
-            return q and q['done'] and q['pending']==0 and job.driver.execute_script('return Date.now()-window.__autoQuery.finished') > 500
-        WebDriverWait(job.driver, 45, poll_frequency=0.2).until(fresh)
+            if q and q['done'] and q['pending']==0 and job.driver.execute_script('return Date.now()-window.__autoQuery.finished') > 500:
+                return True
+            # 请求监听漏报时，必须确认结果区确实发生过变化、页面已稳定且
+            # 已出现新的结果数量或“无数据”提示，不能直接读取旧表格。
+            return bool(job.driver.execute_script('''
+              const m=window.__autoResultMutation;
+              if(!m || !m.count || Date.now()-m.last<800) return false;
+              const loading=[...document.querySelectorAll('.el-loading-mask,.loading_,.loading')]
+                .some(e=>{const s=getComputedStyle(e);return s.display!=='none'&&s.visibility!=='hidden'&&e.offsetParent!==null;});
+              if(loading) return false;
+              const text=document.body.innerText||'';
+              return /为您筛选到\\s*\\d+\\s*条数据/.test(text) || /暂无数据|没有数据/.test(text);
+            '''))
+        WebDriverWait(job.driver, 90, poll_frequency=0.2).until(fresh)
 
 
 class DeferredNotifier:

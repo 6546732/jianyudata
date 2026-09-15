@@ -2,6 +2,7 @@
 import ast
 import json
 import os
+import subprocess
 import sys
 import time
 import types
@@ -9,6 +10,29 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 BASE = Path(r'D:\桌面\data')
+
+
+def load_login():
+    """读取仅能由当前 Windows 用户解密的剑鱼账号密码。"""
+    credential = ROOT / 'jianyu_credential.xml'
+    if not credential.exists():
+        raise RuntimeError('尚未配置剑鱼账号密码，请运行 setup_jianyu_login.ps1')
+    env = os.environ.copy()
+    env['JIANYU_LOGIN_CREDENTIAL'] = str(credential)
+    command = (
+        "$c=Import-Clixml -LiteralPath $env:JIANYU_LOGIN_CREDENTIAL; "
+        "@{username=$c.UserName;password=$c.GetNetworkCredential().Password} | ConvertTo-Json -Compress"
+    )
+    result = subprocess.run(
+        ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', command],
+        capture_output=True, text=True, timeout=20, env=env,
+        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    if result.returncode:
+        raise RuntimeError('剑鱼账号密码解密失败；请用当前 Windows 用户重新配置')
+    values = json.loads(result.stdout)
+    if not values.get('username') or not values.get('password'):
+        raise RuntimeError('剑鱼账号或密码为空')
+    return values['username'], values['password']
 
 def run():
     notebook = json.loads((ROOT / 'START_AUTO.ipynb').read_text(encoding='utf-8'))
@@ -22,6 +46,15 @@ def run():
                 sources = ast.literal_eval(node.value)
     if sources is None:
         raise RuntimeError('未找到Notebook内嵌程序')
+    # 部署目录中的独立脚本是当前版本；内嵌代码只在对应文件缺失时后备。
+    # 这样修复脚本后不会再被旧 Notebook 内容覆盖。
+    disk_modules = []
+    for name in list(sources):
+        source_file = ROOT / f'{name}.py'
+        if source_file.is_file():
+            sources[name] = source_file.read_text(encoding='utf-8')
+            disk_modules.append(name)
+    print('从磁盘加载最新版模块：' + '、'.join(disk_modules), flush=True)
     # 与用户原Notebook的连续导出修正保持一致。
     sources['fast_range'] = sources['fast_range'].replace(
         "        if (self.state.get('province_batch_stop_day') == self.today().isoformat()\n"
@@ -49,12 +82,13 @@ def run():
             if attempt == 3:
                 raise
             time.sleep(30)
-    # 使用浏览器保存的登录状态；失效时报告，不在无人值守时等待密码输入。
-    sys.modules['auto_login'].PasswordLogin('', '', BASE).ensure(driver)
+    # 登录仍有效时不会填写；失效时才使用本机加密保存的账号密码。
+    username, password = load_login()
+    sys.modules['auto_login'].PasswordLogin(username, password, BASE).ensure(driver)
+    password = None
     state = sys.modules['fast_range'].export_fast(
         driver, base=str(BASE), start='2025-01-03', end=None,
         confirm=True, daily_limit=800, strategy='prefix')
     print('本轮结束：', state['status'], '剩余额度：', state['remaining'], flush=True)
     if state['status'] not in {'waiting_quota', 'province_batch_done', 'day_changed', 'complete', 'complete_with_skips'}:
         raise RuntimeError('导出停止，需要检查状态：' + state['status'])
-

@@ -32,26 +32,41 @@ def alert(log):
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         if result.returncode == 0:
             password = result.stdout.strip()
+    # Google应用专用密码页面按四位分组显示，粘贴时可能带空格。
+    password = ''.join(password.split())
     if not password:
         raise RuntimeError('SMTP授权信息尚未配置，邮件未发送')
     message = EmailMessage()
     message['From'], message['To'] = sender, 'zihao.zhang@smartx.com'
     message['Subject'] = '剑鱼自动导出失败：' + datetime.now().strftime('%Y-%m-%d %H:%M')
-    message.set_content(f'今晚的自动导出未完成，请检查电脑上的日志：{log}\n程序没有自动重试导出扣除。\n')
-    security = config.get('security', 'ssl')
-    if security not in ('ssl', 'starttls'):
+    message.set_content(f'今晚的自动导出未完成，完整日志见附件：{log.name}\n程序没有自动重试导出扣除。\n')
+    message.add_attachment(log.read_text(encoding='utf-8', errors='replace'),
+                           subtype='plain', filename=log.name)
+    configured = config.get('security', 'ssl')
+    if configured not in ('ssl', 'starttls'):
         raise ValueError('只允许SSL或STARTTLS')
-    port = int(config.get('port', 465 if security == 'ssl' else 587))
-    if security == 'ssl':
-        client = smtplib.SMTP_SSL(host, port, timeout=30, context=ssl.create_default_context())
-    else:
-        client = smtplib.SMTP(host, port, timeout=30)
-    with client:
-        if security == 'starttls':
-            client.starttls(context=ssl.create_default_context())
-        client.login(user, password)
-        if client.send_message(message):
-            raise RuntimeError('邮件收件人被拒绝')
+    configured_port = int(config.get('port', 465 if configured == 'ssl' else 587))
+    attempts = [(configured, configured_port)]
+    # 公司网络可能阻断465；Gmail同时支持587 STARTTLS。
+    if host == 'smtp.gmail.com' and ('starttls', 587) not in attempts:
+        attempts.append(('starttls', 587))
+    errors = []
+    for security, port in attempts:
+        try:
+            if security == 'ssl':
+                client = smtplib.SMTP_SSL(host, port, timeout=30, context=ssl.create_default_context())
+            else:
+                client = smtplib.SMTP(host, port, timeout=30)
+            with client:
+                if security == 'starttls':
+                    client.starttls(context=ssl.create_default_context())
+                client.login(user, password)
+                if client.send_message(message):
+                    raise RuntimeError('邮件收件人被拒绝')
+            return
+        except (OSError, TimeoutError, smtplib.SMTPException) as error:
+            errors.append(f'{port}/{security}: {type(error).__name__}: {error}')
+    raise RuntimeError('；'.join(errors))
 
 def main():
     LOGS.mkdir(parents=True, exist_ok=True)
@@ -73,6 +88,7 @@ def main():
         except Exception:
             failed = True
             traceback.print_exc()
+            stream.flush()
             try:
                 alert(log)
                 print('失败提醒邮件已发送')

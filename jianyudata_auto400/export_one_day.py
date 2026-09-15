@@ -42,9 +42,10 @@ def order_counts(text):
     counts = []
     for label in ('本次扣除', '今日限量余额', '本日仍可导出'):
         found = re.findall(re.escape(label) + r'\s*[:：]?\s*(\d+)\s*条', text)
-        if len(found) != 1:
-            raise RuntimeError(f'无法唯一读取{label}，禁止提交。')
-        counts.append(int(found[0]))
+        distinct = {int(value) for value in found}
+        if len(distinct) != 1:
+            raise RuntimeError(f'{label}缺失或显示值互相矛盾，禁止提交：{found}')
+        counts.append(distinct.pop())
     count, balance, remaining = counts
     if not 0 < count <= min(800, balance) or remaining != balance - count:
         raise RuntimeError('条数超额或余额计算不一致，禁止提交。')
@@ -396,6 +397,10 @@ class OneDay:
     def calendar_select(self, element):
         """优先识别现场确认的My97日历；不修改readonly或直接注入日期值。"""
         target = date.fromisoformat(self.day)
+        # 上一笔查询/下载完成后页面可能仍显示加载遮罩。先等它消失，避免点击被拦截。
+        WebDriverWait(self.driver, 60, poll_frequency=0.5).until(
+            lambda _: not any(e.is_displayed() for e in self.driver.find_elements(
+                By.CSS_SELECTOR, '.loading_')))
         element.click()
         try:
             self.find_frame_here(lambda: any(e.is_displayed() for e in self.driver.find_elements(By.CSS_SELECTOR, '.WdateDiv')), timeout=10)
@@ -450,13 +455,22 @@ class OneDay:
         for attempt in range(3):
             try:
                 if attempt:
-                    self.filter_page()
+                    # 日历组件偶尔在连续查询后不弹出。刷新本筛选页再重新定位；此时尚未创建订单。
+                    self.driver.switch_to.default_content()
+                    self.driver.get(FILTER_URL)
+                    self.find_page(lambda: '筛选日期' in self.body() and '关键词匹配方式' in self.body(),
+                                   timeout=30,
+                                   window_filter=lambda h: h == self.driver._jianyu_filter_handle)
                 return self._set_dates_once()
-            except StaleElementReferenceException as error:
+            except (StaleElementReferenceException, TimeoutException, RuntimeError) as error:
+                retryable = (isinstance(error, (StaleElementReferenceException, TimeoutException))
+                             or str(error).startswith('未识别到 Element UI 单日历'))
+                if not retryable:
+                    raise
                 if attempt == 2:
-                    raise RuntimeError('日期控件连续刷新，已停止且未提交。请等待页面加载完成后重新预演。') from error
-                print(f'日期控件已刷新，重新定位并核对日期（{attempt + 1}/2）', flush=True)
-                time.sleep(0.3)
+                    raise RuntimeError('日期控件连续三次未能打开，已停止且未提交。') from error
+                print(f'日期控件未就绪，刷新筛选页后重试（{attempt + 2}/3）', flush=True)
+                time.sleep(1)
 
     def _set_dates_once(self):
         candidates = self.date_inputs()
@@ -542,7 +556,7 @@ class OneDay:
             raise RuntimeError(f'本日查询为{count}条；本测试仅支持1至800条，不拆省份。')
         self.open_order()
 
-    def open_order(self):
+    def open_order(self, prepare_payment=True):
         count = self.state['count']
         if not 0 < count <= 800:
             raise RuntimeError('只能为1至800条创建结算预览')
@@ -573,6 +587,10 @@ class OneDay:
         self._order_created = self._order_window not in before
         self._order_frame_url = self.driver.execute_script('return location.href')
         print(f'已锁定本次订单页：{count}条', flush=True)
+        # 余额探测只读取订单页数字。即使全国条数高于余额并弹出“余额不足”，
+        # 也不寻找协议、不确认扣除；调用方读取余额后关闭本次临时订单页。
+        if not prepare_payment:
+            return
         self.text_click('单日限量数据包')
         WebDriverWait(self.driver, 15).until(lambda _: '本次扣除' in self.body())
         # 附件中的真实协议 DOM：仅点击方框，禁止点协议链接。

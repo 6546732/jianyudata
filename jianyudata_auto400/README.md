@@ -1,4 +1,4 @@
-# 每晚21:00执行Jupyter导出
+# 每晚定时执行Jupyter导出
 
 本目录是当前定时运行版本。每天累计最多800条，沿用 `D:\桌面\data` 中的进度，保留零现金支付校验和提交前pending记录。不要同时启动旧Notebook中的长期调度。
 
@@ -8,10 +8,13 @@
 - `nightly_job.py`：加载 `START_AUTO.ipynb` 中的内嵌程序，复用Chrome登录，连接最多尝试3次。登录失效时停止并提醒，不等待交互输入。
 - `START_AUTO.ipynb`：原交互Notebook，已清除输出。其手动调度时间及400条配置是旧入口，不用于每晚800条任务。
 - `setup_mail.ps1`：在本机输入Google应用专用密码，以当前Windows用户加密保存；不会发送测试邮件。
+- `setup_jianyu_login.ps1`：在本机输入剑鱼账号和密码，以当前Windows用户加密保存；登录仍有效时不会填写，登录失效时自动尝试密码登录。
 
 安装依赖：`python -m pip install -r requirements.txt`。
 
-Windows任务计划程序每天21:00运行 `pythonw.exe`，参数是本目录 `run_scheduled_notebook.py` 的绝对路径，起始目录设为本目录。选择仅用户登录时运行、错过后补跑、已有实例时不启动新实例。任务时区为电脑本地时区，应设置为北京时间。电脑接电禁止自动睡眠，允许关屏和锁屏；不要注销用户。
+Windows任务计划程序运行 `pythonw.exe`，参数是本目录 `run_scheduled_notebook.py` 的绝对路径，起始目录设为本目录。选择仅用户登录时运行、错过后补跑、已有实例时不启动新实例。当前测试时间为每天18:00。任务时区为电脑本地时区，应设置为北京时间。电脑接电禁止自动睡眠，允许关屏和锁屏；不要注销用户。
+
+Chrome由独立的 `Jianyu-Automation-Chrome` 计划任务启动并常驻。导出Notebook只连接该浏览器；导出成功或异常退出均不关闭整个Chrome。程序仍会关闭自己创建并已经完成的临时订单标签页。
 
 ## 邮件与日志
 
@@ -19,8 +22,12 @@ Windows任务计划程序每天21:00运行 `pythonw.exe`，参数是本目录 `r
 
 在PowerShell运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\setup_mail.ps1` 后按提示输入应用专用密码。不要把密码加入代码或Git。
 
-运行日志和执行结果Notebook保存在 `D:\桌面\data\logs`。邮件失败时另外保存 `*-unsent.json`，该文件用于人工检查，不自动补发。失败提醒只包含日志路径，不包含密码或完整运行日志。
+运行日志和执行结果Notebook保存在 `D:\桌面\data\logs`。失败提醒邮件附上本次日志，不包含密码。邮件失败时另外保存 `*-unsent.json`，该文件用于人工检查，不自动补发。
+
+余额探测只进入订单预览读取“今日限量余额”，不会勾选协议或确认扣除。全国条数超过余额时，网站可能短暂显示“余额不足”，程序读取余额后关闭该临时页，并回到筛选页按省份顺序拆分。
 
 程序不自动重试导出扣除。下载或提交状态不确定时按原pending恢复。旧 `daily_scheduler.lock` 存在时拒绝并行启动，不自动删除锁。
+
+在 PowerShell 运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\setup_jianyu_login.ps1`，按提示输入剑鱼账号和密码。生成的 `jianyu_credential.xml` 只能由当前 Windows 用户解密，并被 `.gitignore` 排除。若网站要求短信验证码、滑块或扫码，自动登录会停止并触发失败提醒，不会反复尝试。
 
 本次版本未运行实际导出或邮件发送测试。

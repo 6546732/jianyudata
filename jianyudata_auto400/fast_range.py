@@ -155,6 +155,11 @@ class FastRange(ExportRange):
                 self.save()
                 raise RuntimeError('组合实际条数发生变化，未提交；请核对缓存后重新规划')
             balance, actual = self.backend.prepare(self.state['current_date'], regions, count)
+            check = self.backend.last_order_check
+            if not isinstance(check, dict):
+                raise RuntimeError('缺少最终订单额度记录，禁止提交')
+            self.state.setdefault('order_checks', []).append(check)
+            self.save()
             if type(balance) is not int or not 0 <= balance <= 800 or actual != count:
                 raise RuntimeError('结算条数或余额不合法')
             if self.today().isoformat() != run_day:
@@ -172,7 +177,8 @@ class FastRange(ExportRange):
             if not self.confirm:
                 return self.stop('preview')
             pending = {'batch_id': uuid4().hex, 'date': self.state['current_date'], 'regions': regions,
-                       'items': selected, 'count': count, 'quota_day': run_day}
+                       'items': selected, 'count': count, 'quota_day': run_day,
+                       'order_check': check}
             self.state.update(pending=pending, remaining=remaining-count, status='submitting')
             self.save()
             self.finish_pending(self.backend.submit(pending['batch_id']))
