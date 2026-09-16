@@ -16,7 +16,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import (
-    NoSuchWindowException, StaleElementReferenceException, TimeoutException,
+    ElementClickInterceptedException, NoSuchWindowException,
+    StaleElementReferenceException, TimeoutException,
 )
 
 FILTER_URL = ('https://www.jianyu360.cn/page_workDesktop/work-bench/page'
@@ -92,6 +93,8 @@ def xlsx_rows(path):
 
 
 class OneDay:
+    reauthenticate = None
+
     def __init__(self, driver, day, base, confirm):
         self.driver, self.day, self.confirm = driver, date.fromisoformat(day).isoformat(), confirm
         self.base = Path(base)
@@ -108,6 +111,24 @@ class OneDay:
 
     def body(self):
         return self.driver.find_element(By.TAG_NAME, 'body').text
+
+    def login_prompt_visible(self):
+        return any(e.is_displayed() for e in self.driver.find_elements(
+            By.CSS_SELECTOR, '#bidLogin.modal.in, #bidLogin[style*="display: block"]'))
+
+    def reauthenticate_if_needed(self):
+        if not self.login_prompt_visible():
+            return False
+        callback = type(self).reauthenticate
+        if callback is None:
+            raise RuntimeError('检测到登录弹窗，但本次任务未配置自动重新登录。')
+        print('检测到登录弹窗，使用本机加密凭据重新登录。', flush=True)
+        callback(self.driver)
+        self.filter_page()
+        if self.login_prompt_visible():
+            raise RuntimeError('自动重新登录后弹窗仍存在，停止。')
+        print('重新登录成功，继续当前日期。', flush=True)
+        return True
 
     def unique(self, by, locator):
         matches = [e for e in self.driver.find_elements(by, locator) if e.is_displayed()]
@@ -454,6 +475,7 @@ class OneDay:
         # 页面异步重绘会使旧 input 引用失效；仅重试日期设置，不重试查询/扣额。
         for attempt in range(3):
             try:
+                self.reauthenticate_if_needed()
                 if attempt:
                     # 日历组件偶尔在连续查询后不弹出。刷新本筛选页再重新定位；此时尚未创建订单。
                     self.driver.switch_to.default_content()
@@ -462,6 +484,13 @@ class OneDay:
                                    timeout=30,
                                    window_filter=lambda h: h == self.driver._jianyu_filter_handle)
                 return self._set_dates_once()
+            except ElementClickInterceptedException as error:
+                if not self.login_prompt_visible():
+                    raise
+                self.reauthenticate_if_needed()
+                if attempt == 2:
+                    raise RuntimeError('运行中重新登录后日期控件仍被遮挡，已停止。') from error
+                continue
             except (StaleElementReferenceException, TimeoutException, RuntimeError) as error:
                 retryable = (isinstance(error, (StaleElementReferenceException, TimeoutException))
                              or str(error).startswith('未识别到 Element UI 单日历'))

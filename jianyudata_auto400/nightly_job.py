@@ -84,7 +84,11 @@ def run():
             time.sleep(30)
     # 登录仍有效时不会填写；失效时才使用本机加密保存的账号密码。
     username, password = load_login()
-    sys.modules['auto_login'].PasswordLogin(username, password, BASE).ensure(driver)
+    login = sys.modules['auto_login'].PasswordLogin(username, password, BASE)
+    login.ensure(driver)
+    # 网站可能在长时间连续导出期间再次显示登录框；只在明确识别该弹窗时
+    # 使用同一份内存凭据登录，登录成功后恢复当前进度。
+    sys.modules['export_one_day'].OneDay.reauthenticate = login.ensure
     password = None
     state = sys.modules['fast_range'].export_fast(
         driver, base=str(BASE), start='2025-01-03', end=None,

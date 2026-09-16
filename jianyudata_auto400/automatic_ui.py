@@ -1,5 +1,6 @@
 """现场DOM验证的自动筛选适配器（2026-09-11）。"""
 import re
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -30,9 +31,35 @@ class AutomaticUI:
         def selected():
             return {e.text.strip() for e in d.find_elements(By.CSS_SELECTOR, '#area-del .delete-close')}
         current = selected()
-        if not regions or '全国' in current:
-            job.visible_click(job.unique(By.XPATH, "//div[@id='area-del']/following-sibling::div[contains(@class,'select-area-box')][1]/span[normalize-space(.)='全国']"))
+        national = "//div[@id='area-del']/following-sibling::div[contains(@class,'select-area-box')][1]/span[normalize-space(.)='全国']"
+        if not regions:
+            # 正常情况下，点击“全国”会把全部省份标签替换为唯一的“全国”标签。
+            # 页面偶尔不响应第一次点击，届时逐个重新定位并清除旧标签后重试。
+            job.visible_click(job.unique(By.XPATH, national))
+            try:
+                WebDriverWait(d, 20).until(lambda _: selected() == {'全国'})
+            except TimeoutException:
+                for _ in range(40):
+                    chips = [e for e in d.find_elements(By.CSS_SELECTOR, '#area-del .delete-close')
+                             if e.is_displayed() and e.text.strip() != '全国']
+                    if not chips:
+                        break
+                    chip = chips[0]
+                    name = chip.text.strip()
+                    closes = chip.find_elements(By.CSS_SELECTOR, '.icon-guanbi')
+                    if len(closes) != 1:
+                        raise RuntimeError(f'无法唯一定位{name}的关闭图标')
+                    before = len(chips)
+                    job.visible_click(closes[0])
+                    WebDriverWait(d, 5).until(lambda _: name not in selected())
+                else:
+                    raise RuntimeError('省份标签超过40个，拒绝继续清除')
+                job.visible_click(job.unique(By.XPATH, national))
+                WebDriverWait(d, 20).until(lambda _: selected() == {'全国'})
             current = set()
+        elif '全国' in current:
+            job.visible_click(job.unique(By.XPATH, national))
+            current = selected()
         # 已经选择全部/多数省份时，只删除差集，不重新添加所有省份。
         for name in sorted(current - set(regions)):
             chips = [e for e in d.find_elements(By.CSS_SELECTOR, '#area-del .delete-close') if e.text.strip() == name]
@@ -50,8 +77,8 @@ class AutomaticUI:
                     raise RuntimeError(f'{name}的全省选项未唯一定位')
                 job.visible_click(all_region[0])
                 job.visible_click(job.unique(By.CSS_SELECTOR, "button[onclick='areaSelect(true)']"))
-        WebDriverWait(d, 8).until(lambda _: selected() == (set(regions) if regions else {'全国'}) or
-                                 (not regions and selected() == set()))
+        WebDriverWait(d, 20).until(lambda _: selected() == (set(regions) if regions else {'全国'}) or
+                                  (not regions and selected() == set()))
         self.arm_query(job)
 
     def arm_query(self, job):
