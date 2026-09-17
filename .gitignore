@@ -4,6 +4,7 @@ __pycache__/
 notebook_chrome/
 browser_profile/
 downloads/
+sfoa_upload/
 *.log
 run.lock
 one_day_*.json

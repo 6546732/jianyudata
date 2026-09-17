@@ -2,6 +2,8 @@
 
 本目录是当前定时运行版本。每天累计最多800条，沿用 `D:\桌面\data` 中的进度，保留零现金支付校验和提交前pending记录。不要同时启动旧Notebook中的长期调度。
 
+导出安全结束后，同一计划任务会调用 `sfoa/sync_to_salesforce.py`，仅把新增或变化的 XLSX 明细 upsert 到 Salesforce `zihao` 沙盒。明细上传失败会写入原计划任务日志并触发失败邮件，不会重新扣剑鱼额度。增量清单在 `D:\桌面\data\sfoa_sync_manifest.json`，逐字段核对报告在 `D:\桌面\data\sfoa_upload\reconcile_report.json`。AI 标签目前只完成单条联调，未启用每日批量模型调用。
+
 ## 入口
 
 - `run_scheduled_notebook.py`：Windows计划任务入口，启动Jupyter内核执行 `NIGHTLY_2100.ipynb`，每次只运行一轮。

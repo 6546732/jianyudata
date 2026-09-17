@@ -145,3 +145,14 @@ def run():
     print('本轮结束：', state['status'], '剩余额度：', state['remaining'], flush=True)
     if state['status'] not in {'waiting_quota', 'province_batch_done', 'day_changed', 'complete', 'complete_with_skips'}:
         raise RuntimeError('导出停止，需要检查状态：' + state['status'])
+    # 仅在导出状态安全且 XLSX 已完整保存后做 Salesforce 增量同步。
+    # 同步失败会被外层计划任务捕获并邮件提醒；导出进度不会回滚或再次扣额。
+    sfoa_directory = ROOT.parent / 'sfoa'
+    if not sfoa_directory.is_dir():
+        sfoa_directory = ROOT / 'sfoa'
+    if not sfoa_directory.is_dir():
+        raise RuntimeError('未找到 sfoa 同步模块；本轮 Excel 已保存，但尚未上传 Salesforce')
+    sys.path.insert(0, str(sfoa_directory))
+    from sync_to_salesforce import sync
+    summary = sync(BASE, target_org='zihao')
+    print('Salesforce 同步：', summary, flush=True)

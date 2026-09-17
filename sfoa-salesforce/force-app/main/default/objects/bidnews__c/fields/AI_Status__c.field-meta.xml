@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>AI_Status__c</fullName>
+    <label>AI 识别状态</label>
+    <type>Text</type>
+    <length>30</length>
+    <defaultValue>"待识别"</defaultValue>
+</CustomField>

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Winner_Registry_Email__c</fullName>
+    <label>企业公示中标单位邮箱</label>
+    <type>LongTextArea</type>
+    <length>1024</length>
+    <visibleLines>10</visibleLines>
+</CustomField>

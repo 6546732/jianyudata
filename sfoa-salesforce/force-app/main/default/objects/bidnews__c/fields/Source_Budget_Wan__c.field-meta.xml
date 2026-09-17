@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Source_Budget_Wan__c</fullName>
+    <label>预算金额（万元，精确）</label>
+    <type>Number</type>
+    <precision>18</precision>
+    <scale>3</scale>
+</CustomField>

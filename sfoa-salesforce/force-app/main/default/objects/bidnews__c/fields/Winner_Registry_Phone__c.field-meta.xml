@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Winner_Registry_Phone__c</fullName>
+    <label>企业公示中标单位电话</label>
+    <type>Text</type>
+    <length>255</length>
+</CustomField>

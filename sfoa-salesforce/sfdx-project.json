@@ -1,0 +1,7 @@
+{
+  "packageDirectories": [{"path": "force-app", "default": true}],
+  "name": "jianyu-tender-sfoa",
+  "namespace": "",
+  "sfdcLoginUrl": "https://smartx--zihao.sandbox.my.sfcrmproducts.cn",
+  "sourceApiVersion": "65.0"
+}

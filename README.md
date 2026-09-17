@@ -1,5 +1,7 @@
 # 剑鱼标讯单日导出
 
+Salesforce `zihao` 沙盒的标讯明细入库、AI 标签和逐字段核对说明见 [sfoa/README.md](sfoa/README.md)。每日运行版在 `jianyudata_auto400`，其 11:00 计划任务在导出后做 Salesforce 增量同步。
+
 验证日期：2026-09-10。
 
 成功版本：`2026-09-10-my97-v5`。

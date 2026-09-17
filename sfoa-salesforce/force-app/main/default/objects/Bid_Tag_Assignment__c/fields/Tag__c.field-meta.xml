@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Tag__c</fullName>
+    <label>标签</label>
+    <referenceTo>Tag__c</referenceTo>
+    <relationshipLabel>标讯标签关联</relationshipLabel>
+    <relationshipName>Bid_Tag_Assignments</relationshipName>
+    <type>Lookup</type>
+</CustomField>
