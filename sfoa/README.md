@@ -2,7 +2,7 @@
 
 本目录只处理已下载的标讯明细 XLSX；不处理全国每日条数表，也不会在 Git 中保存明细、联系人或 Salesforce 凭据。源文件在 `D:\桌面\data\downloads`，上传报告在 `D:\桌面\data\sfoa_upload`。
 
-截至 2026-09-17，24 个 Excel 有 3,031 行，按来源内容去重后是 3,028 条。`bidnews__c` 中已核对为 3,028 条；Bulk API 作业 `750C5000004citlIAA` 处理 3,028 条，失败 0 条。`reconcile_report.json` 的可计数字段全部一致，长正文、范围、邮箱和小数金额做了逐值抽查。公告标题、公告地址、剑鱼标讯地址三列在这批 Excel 中全部为空；记录显示名由项目名称补足，网址不能补造。
+截至 2026-09-17，24 个 Excel 有 3,031 行，按来源内容去重后是 3,028 条。首次上传时，公告标题、公告地址和剑鱼标讯地址被遗漏：这三列是 Excel 的 `HYPERLINK()` 公式，旧脚本 `data_only=True` 只读公式缓存，而源文件没有缓存。现已修正公式解析器，Bulk API 作业 `750C5000004cld8IAA` 按原唯一键补传 3,028 条，失败 0 条。核对后 Salesforce 仍为 3,028 条；标题、剑鱼地址、完整公告地址均为 3,028 条，短公告地址字段为 3,010 条，其余 18 条地址超过 255 字符，完整保存在长文本字段。`reconcile_report.json` 的字段计数通过，四个标题/网址字段逐条核对 3,028 条也全部一致，其他长文本等字段抽样比对通过。
 
 ## Excel 与 Salesforce 字段
 
@@ -11,11 +11,11 @@
 | 序号 | `Source_Row_Number__c` | 原文件行号 |
 | 匹配关键词 | `Matching_Keywords__c` | 原值 |
 | 省份 / 城市 / 区县 | `bidstate__c` / `bidcity__c` / `Source_District__c` | 原值 |
-| 公告标题 | `Full_Title__c`、`Name` | 源列全空；当前以项目名称作显示标题 |
+| 公告标题 | `Full_Title__c`、`Name` | 从 `HYPERLINK()` 的显示文字读取 |
 | 公告类别 | `Publication_Category__c`、`type__c` | 两字段均写入原值 |
 | 公告内容 | `Source_Content__c`、`content__c` | 前者完整保存，后者兼容旧页面、最多 32,768 字符 |
 | 发布时间 | `release_date__c` | 日期 |
-| 公告地址 / 剑鱼标讯地址 | `website__c` / `swordfishwebsite__c` | 源列全空 |
+| 公告地址 / 剑鱼标讯地址 | `website__c`、`Announcement_Url_Full__c` / `swordfishwebsite__c` | 从 `HYPERLINK()` 的显示文字读取；18 条公告地址超过 255 字符，完整值放长文本字段，短网址同时放 `website__c` |
 | 项目名称 / 行业 / 项目编号 / 项目范围 | `Project_Name__c` / `Source_Industry__c` / `Full_Project_Number__c` / `Project_Scope__c` | 原值；旧 `projectnumber__c` 太短时留空，以完整字段为准 |
 | 预算金额 / 中标金额（万元） | `Source_Budget_Wan__c` / `Source_Winning_Wan__c` | 保留小数和“万元”单位；旧金额字段单位与精度不明确，不用于统计 |
 | 报名截止 / 开标 / 投标截止 / 合同签订日期 | `Registration_Deadline__c` / `bidopeningdate__c` / `biddeadline__c` / `Contract_Signed_Date__c` | Excel 中没有“开票日期”列 |

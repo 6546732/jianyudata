@@ -9,12 +9,15 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
+from prepare_import import excel_value
+
 
 def profile(root: Path) -> dict:
     files = sorted(p for p in root.rglob("*.xlsx") if not p.name.startswith("~$"))
     result = {
         "files": len(files), "rows": 0, "missing_title": 0,
         "missing_jianyu_url": 0, "missing_announcement_url": 0,
+        "announcement_url_over_255": 0,
         "missing_project_number": 0, "missing_industry": 0,
         "missing_winning_amount": 0, "max_length": {},
         "nonempty_by_column": [0] * 33, "max_length_by_column": [0] * 33,
@@ -24,19 +27,22 @@ def profile(root: Path) -> dict:
     }
     urls, fingerprints = set(), set()
     for path in files:
-        book = load_workbook(path, read_only=True, data_only=True)
+        book = load_workbook(path, read_only=True, data_only=False)
         try:
             sheet = book.active
-            rows = sheet.iter_rows(values_only=True)
-            header = next(rows, ())
+            rows = sheet.iter_rows()
+            header = tuple(cell.value for cell in next(rows, ()))
             next(rows, None)  # merged subheader
             result["header_variants"]["|".join(str(x or "") for x in header)] += 1
-            for row in rows:
-                if not row or not any(v is not None for v in row):
+            for row_number, cells in enumerate(rows, start=3):
+                if not cells or not any(cell.value is not None for cell in cells):
                     continue
+                row = tuple(excel_value(cell, f"{path.name} 第{row_number}行 第{index}列")
+                            for index, cell in enumerate(cells, start=1))
                 if len(row) < 17:
                     continue
                 result["rows"] += 1
+                result["announcement_url_over_255"] += len(str(row[9] or "")) > 255
                 for index, value in enumerate(row[:33]):
                     value_text = str(value).strip() if value is not None else ""
                     result["nonempty_by_column"][index] += bool(value_text)

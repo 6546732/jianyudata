@@ -188,6 +188,10 @@
                 <behavior>Edit</behavior>
                 <field>Source_Content__c</field>
             </layoutItems>
+            <layoutItems>
+                <behavior>Edit</behavior>
+                <field>Announcement_Url_Full__c</field>
+            </layoutItems>
         </layoutColumns>
         <layoutColumns>
             <layoutItems>

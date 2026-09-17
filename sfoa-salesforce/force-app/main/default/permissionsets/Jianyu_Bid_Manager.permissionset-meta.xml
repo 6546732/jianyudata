@@ -238,6 +238,11 @@
     </fieldPermissions>
     <fieldPermissions>
         <editable>true</editable>
+        <field>bidnews__c.Announcement_Url_Full__c</field>
+        <readable>true</readable>
+    </fieldPermissions>
+    <fieldPermissions>
+        <editable>true</editable>
         <field>Bid_Tag_Assignment__c.Assignment_Key__c</field>
         <readable>true</readable>
     </fieldPermissions>

@@ -35,10 +35,30 @@ FIELDS = [
     "Source_Content__c", "content__c", "Source_Content_Hash__c",
     "Project_Scope__c", "Registration_Deadline__c", "bidopeningdate__c",
     "biddeadline__c", "Contract_Signed_Date__c",
-    "website__c", "swordfishwebsite__c", "Source_File__c",
+    "website__c", "Announcement_Url_Full__c", "swordfishwebsite__c", "Source_File__c",
 ]
 AWARDED = {"中标", "成交"}
 OPEN = {"招标", "竞价", "竞谈", "询价", "磋商", "单一", "邀请", "采购意向", "需求公示", "预告"}
+HYPERLINK = re.compile(
+    # Jianyu sometimes puts unescaped quotation marks in the visible title.
+    # The target URL has no quotes; take the rest through the final quote as
+    # display text rather than trying to evaluate the malformed formula.
+    r'^HYPERLINK\(\s*"([^"]*)"\s*[,;]\s*"(.*)"\s*\)$',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def excel_value(cell, location: str):
+    """Read the visible text of Jianyu's HYPERLINK formulas without evaluating Excel code."""
+    value = cell.value
+    if cell.data_type != "f":
+        return value
+    formula = str(value).lstrip("=").strip()
+    match = HYPERLINK.fullmatch(formula)
+    if not match:
+        raise ValueError(f"无法解析公式，停止上传：{location}")
+    target, display = (part.replace('""', '"') for part in match.groups())
+    return display or target
 
 
 def clean(value) -> str:
@@ -73,8 +93,8 @@ def amount(value, errors: Counter) -> str:
 
 
 def source_key(row) -> str:
-    # URL/title are absent in the current export batch. Use the entire source
-    # content and stable identifying columns; never the export filename/row no.
+    # Keep the existing key independent of hyperlink columns so corrected
+    # formula parsing updates the same Salesforce records without duplicates.
     parts = [clean(row[i]) for i in (2, 3, 6, 7, 11, 13)]
     parts.insert(0, day(row[8]))
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
@@ -126,7 +146,8 @@ def record(row, file_name: str, errors: Counter) -> dict:
         "bidopeningdate__c": day(row[18]),
         "biddeadline__c": day(row[19]),
         "Contract_Signed_Date__c": day(row[20]),
-        "website__c": clean(row[9]),
+        "website__c": clean(row[9]) if len(clean(row[9])) <= 255 else "",
+        "Announcement_Url_Full__c": clean(row[9]),
         "swordfishwebsite__c": clean(row[10]),
         "Source_File__c": file_name[:255],
     }
@@ -158,20 +179,22 @@ def prepare(root: Path, output: Path, selected_files=None) -> dict:
         for path in files:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="Workbook contains no default style")
-                book = load_workbook(path, read_only=True, data_only=True)
+                book = load_workbook(path, read_only=True, data_only=False)
             try:
                 sheet = book.active
-                rows = sheet.iter_rows(values_only=True)
-                header = next(rows, ())
+                rows = sheet.iter_rows()
+                header = tuple(cell.value for cell in next(rows, ()))
                 if len(header) != 33 or clean(header[8]) != "发布时间":
                     raise ValueError(f"文件表头不符合已核验的 33 列格式：{path}")
                 next(rows, None)  # second header row
-                for row in rows:
-                    if not row or not any(value is not None for value in row):
+                for row_number, cells in enumerate(rows, start=3):
+                    if not cells or not any(cell.value is not None for cell in cells):
                         continue
                     rows_read += 1
-                    if len(row) != 33:
-                        raise ValueError(f"数据行列数异常：{path} 第 {rows_read} 行")
+                    if len(cells) != 33:
+                        raise ValueError(f"数据行列数异常：{path} 第 {row_number} 行")
+                    row = tuple(excel_value(cell, f"{path.name} 第{row_number}行 第{index}列")
+                                for index, cell in enumerate(cells, start=1))
                     item = record(row, path.name, errors)
                     if item["Source_Key__c"] in seen:
                         duplicates += 1

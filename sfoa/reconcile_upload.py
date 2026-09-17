@@ -17,8 +17,9 @@ from pathlib import Path
 
 from sync_to_salesforce import DEFAULT_BASE, NODE, SF_CLI
 
-LONG_TEXT = {"Source_Content__c", "content__c", "Project_Scope__c", "Winner_Registry_Email__c"}
+LONG_TEXT = {"Source_Content__c", "content__c", "Project_Scope__c", "Winner_Registry_Email__c", "Announcement_Url_Full__c"}
 DECIMALS = {"Source_Budget_Wan__c", "Source_Winning_Wan__c"}
+LINK_FIELDS = ("Full_Title__c", "website__c", "Announcement_Url_Full__c", "swordfishwebsite__c")
 
 
 def query(soql: str, org: str) -> list[dict]:
@@ -45,6 +46,7 @@ def reconcile(base: Path = DEFAULT_BASE, org: str = "zihao") -> dict:
     csv.field_size_limit(2**31 - 1)
     expected: Counter = Counter()
     samples: dict[str, dict] = {}
+    expected_links: dict[str, dict] = {}
     total = 0
     with csv_path.open("r", newline="", encoding="utf-8") as stream:
         reader = csv.DictReader(stream)
@@ -54,6 +56,7 @@ def reconcile(base: Path = DEFAULT_BASE, org: str = "zihao") -> dict:
             for field, value in row.items():
                 expected[field] += bool(value)
             key = row["Source_Key__c"]
+            expected_links[key] = {field: row[field] for field in LINK_FIELDS}
             if len(samples) < 3:
                 samples[key] = row
             if row.get("Source_Winning_Wan__c") and "." in row["Source_Winning_Wan__c"] and "decimal" not in samples:
@@ -77,6 +80,8 @@ def reconcile(base: Path = DEFAULT_BASE, org: str = "zihao") -> dict:
     for label, row in samples.items():
         key = row["Source_Key__c"]
         selected = ["Source_Content__c", "content__c", "Project_Scope__c",
+                    "Full_Title__c", "website__c", "Announcement_Url_Full__c",
+                    "swordfishwebsite__c",
                     "Winner_Registry_Email__c", "Source_Budget_Wan__c", "Source_Winning_Wan__c"]
         records = query("SELECT " + ", ".join(selected) +
                         " FROM bidnews__c WHERE Source_Key__c = '" + key + "'", org)
@@ -94,12 +99,30 @@ def reconcile(base: Path = DEFAULT_BASE, org: str = "zihao") -> dict:
                 equal = source_value == ("" if remote_value is None else str(remote_value))
             checks[field] = equal
         sample_results[label] = checks
+    remote_links = query("SELECT Source_Key__c, " + ", ".join(LINK_FIELDS) +
+                         " FROM bidnews__c", org)
+    link_mismatches: Counter = Counter()
+    remote_keys: set[str] = set()
+    for item in remote_links:
+        key = item["Source_Key__c"]
+        remote_keys.add(key)
+        expected_row = expected_links.get(key)
+        if expected_row is None:
+            link_mismatches["unexpected_record"] += 1
+            continue
+        for field in LINK_FIELDS:
+            if expected_row[field] != (item.get(field) or ""):
+                link_mismatches[field] += 1
+    link_mismatches["missing_record"] = len(expected_links.keys() - remote_keys)
     report = {
         "expected_rows": total,
         "salesforce_rows": int(aggregates["total"]),
         "fields": field_results,
         "source_long_text_nonempty": {field: expected[field] for field in LONG_TEXT},
         "sample_exact_matches": sample_results,
+        "all_link_records_compared": len(remote_links),
+        "link_mismatches": dict(link_mismatches),
+        "all_link_checks_passed": not any(link_mismatches.values()),
         "all_count_checks_passed": int(aggregates["total"]) == total and all(
             item["matched"] for item in field_results.values()
         ),
