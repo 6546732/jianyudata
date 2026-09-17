@@ -26,6 +26,13 @@ WORDS = {'超融合', '分布式存储', '私有云', '虚拟化'}
 VERSION = '2026-09-13-range-prefix-100-v6'
 
 
+class BlockedControlError(RuntimeError):
+    """A confirmed pre-submit UI control could not be clicked safely."""
+    def __init__(self, control, cover):
+        self.control, self.cover = control, cover
+        super().__init__(f'{control}仍被{cover}遮挡，未强制点击。')
+
+
 def calendar_month(text):
     year = re.search(r'(\d{4})\s*年', text)
     month = re.search(r'(\d{1,2})\s*月', text)
@@ -161,7 +168,7 @@ class OneDay:
                        if e.is_displayed() and e.is_enabled() and e.text.strip() == '立即导出']
             if len(buttons) != 1:
                 raise RuntimeError('底部正式导出按钮不唯一，尚未点击。')
-            self.visible_click(buttons[0])
+            self.visible_click(buttons[0], wait_seconds=30)
             return
         xpath = ".//*[normalize-space(text())='立即导出']"
 
@@ -190,12 +197,12 @@ class OneDay:
                     for element in controls(scope):
                         choices[element.id] = element
             if len(choices) == 1:
-                self.visible_click(next(iter(choices.values())))
+                self.visible_click(next(iter(choices.values())), wait_seconds=30)
                 return
 
         choices = controls(self.driver.find_element(By.TAG_NAME, 'body'))
         if len(choices) == 1:
-            self.visible_click(choices[0])
+            self.visible_click(choices[0], wait_seconds=30)
             return
         diagnostic = [e.find_element(By.XPATH, '..').get_attribute('outerHTML')[:8000]
                       for e in choices]
@@ -203,7 +210,7 @@ class OneDay:
         path.write_text(json.dumps(diagnostic, ensure_ascii=False, indent=2), encoding='utf-8')
         raise RuntimeError(f'导出入口仍有{len(choices)}个候选，尚未点击；控件结构已保存到{path}')
 
-    def visible_click(self, element):
+    def visible_click(self, element, wait_seconds=3):
         """先滚动并检查真实命中位置；不执行JS click，不重复提交点击。"""
         self.driver.execute_script(
             "arguments[0].scrollIntoView({block:'center',inline:'center',behavior:'instant'});", element)
@@ -225,13 +232,36 @@ class OneDay:
             if offset:
                 self.driver.execute_script('window.scrollBy(0, arguments[0]);', offset)
             try:
-                WebDriverWait(self.driver, 3, poll_frequency=0.2).until(uncovered)
+                WebDriverWait(self.driver, wait_seconds, poll_frequency=0.2).until(uncovered)
                 break
             except TimeoutException:
                 continue
         else:
-            raise RuntimeError('控件仍被固定栏或弹窗遮挡，已停止，未强制点击。')
-        element.click()
+            cover = self.driver.execute_script("""
+                const e=arguments[0],r=e.getBoundingClientRect();
+                const x=(Math.max(0,r.left)+Math.min(innerWidth,r.right))/2;
+                const y=(Math.max(0,r.top)+Math.min(innerHeight,r.bottom))/2;
+                const h=document.elementFromPoint(x,y);
+                return h ? `${h.tagName.toLowerCase()}#${h.id}.${String(h.className).slice(0,100)}` : '视口外';
+            """, element)
+            control = self.driver.execute_script("""
+                const e=arguments[0];
+                return `${e.tagName.toLowerCase()}#${e.id}.${String(e.className).slice(0,100)}`;
+            """, element)
+            raise BlockedControlError(control, cover)
+        try:
+            element.click()
+        except ElementClickInterceptedException as error:
+            cover = self.driver.execute_script("""
+                const e=arguments[0],r=e.getBoundingClientRect();
+                const h=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);
+                return h ? `${h.tagName.toLowerCase()}#${h.id}.${String(h.className).slice(0,100)}` : '视口外';
+            """, element)
+            control = self.driver.execute_script("""
+                const e=arguments[0];
+                return `${e.tagName.toLowerCase()}#${e.id}.${String(e.className).slice(0,100)}`;
+            """, element)
+            raise BlockedControlError(control, cover) from error
 
     def filter_submit(self):
         """只选与“重置”同组的确定，排除日期行上的确定。"""
@@ -373,6 +403,22 @@ class OneDay:
                 return False
         self.find_frame_here(has_dates)
 
+    def find_my97_frame(self, timeout=20):
+        """My97 把日历放在工作台顶层的 about:blank 兄弟 iframe。"""
+        def probe(_):
+            self.driver.switch_to.default_content()
+            for frame in self.driver.find_elements(By.CSS_SELECTOR, 'iframe[src="about:blank"]'):
+                try:
+                    self.driver.switch_to.frame(frame)
+                    if (self.driver.find_elements(By.CSS_SELECTOR, '.WdateDiv')
+                            and self.driver.find_elements(By.CSS_SELECTOR, '.WdayTable td[onclick]')):
+                        return True
+                except (StaleElementReferenceException, NoSuchWindowException):
+                    pass
+                self.driver.switch_to.default_content()
+            return False
+        WebDriverWait(self.driver, timeout, poll_frequency=0.2).until(probe)
+
     def my97_month(self):
         months = set()
         for cell in self.driver.find_elements(By.CSS_SELECTOR, '.WdayTable td[onclick]'):
@@ -419,12 +465,18 @@ class OneDay:
         """优先识别现场确认的My97日历；不修改readonly或直接注入日期值。"""
         target = date.fromisoformat(self.day)
         # 上一笔查询/下载完成后页面可能仍显示加载遮罩。先等它消失，避免点击被拦截。
-        WebDriverWait(self.driver, 60, poll_frequency=0.5).until(
-            lambda _: not any(e.is_displayed() for e in self.driver.find_elements(
-                By.CSS_SELECTOR, '.loading_')))
-        element.click()
         try:
-            self.find_frame_here(lambda: any(e.is_displayed() for e in self.driver.find_elements(By.CSS_SELECTOR, '.WdateDiv')), timeout=10)
+            WebDriverWait(self.driver, 60, poll_frequency=0.5).until(
+                lambda _: not any(e.is_displayed() for e in self.driver.find_elements(
+                    By.CSS_SELECTOR, '.loading_, .el-loading-mask')))
+        except TimeoutException as error:
+            masks = [e for e in self.driver.find_elements(
+                By.CSS_SELECTOR, '.loading_, .el-loading-mask') if e.is_displayed()]
+            covers = [f'{e.tag_name}.{e.get_attribute("class")[:120]}' for e in masks]
+            raise BlockedControlError('日期输入框', ', '.join(covers) or '加载遮罩状态未知') from error
+        self.visible_click(element, wait_seconds=15)
+        try:
+            self.find_my97_frame(timeout=20)
         except TimeoutException:
             self.restore_date_frame()
         else:

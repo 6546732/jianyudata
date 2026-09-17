@@ -7,6 +7,7 @@ import sys
 import time
 import types
 from pathlib import Path
+from datetime import datetime
 
 ROOT = Path(__file__).resolve().parent
 BASE = Path(r'D:\桌面\data')
@@ -90,9 +91,57 @@ def run():
     # 使用同一份内存凭据登录，登录成功后恢复当前进度。
     sys.modules['export_one_day'].OneDay.reauthenticate = login.ensure
     password = None
-    state = sys.modules['fast_range'].export_fast(
-        driver, base=str(BASE), start='2025-01-03', end=None,
-        confirm=True, daily_limit=800, strategy='prefix')
+    def export_from_progress():
+        return sys.modules['fast_range'].export_fast(
+            driver, base=str(BASE), start='2025-01-03', end=None,
+            confirm=True, daily_limit=800, strategy='prefix')
+
+    def record_cover(error, attempt, phase, blank=None):
+        progress = json.loads((BASE / 'range_progress.json').read_text(encoding='utf-8'))
+        record = {
+            'time': datetime.now().astimezone().isoformat(),
+            'attempt': attempt, 'max_attempts': 3, 'phase': phase,
+            'date': progress.get('current_date'),
+            'status': progress.get('status'),
+            'remaining': progress.get('remaining'),
+            'pending': bool(progress.get('pending')),
+            'control': error.control, 'cover': error.cover,
+        }
+        if blank is not None:
+            record['blank_click'] = blank
+        cover_log = BASE / 'logs' / 'cover_retries.jsonl'
+        cover_log.parent.mkdir(parents=True, exist_ok=True)
+        with cover_log.open('a', encoding='utf-8') as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + '\n')
+        print(f'遮挡记录 {attempt}/3：{record}', flush=True)
+        return progress
+
+    for attempt in range(1, 4):
+        try:
+            state = export_from_progress()
+            break
+        except sys.modules['export_one_day'].BlockedControlError as error:
+            progress = record_cover(error, attempt, 'first_block')
+            if progress.get('pending'):
+                raise RuntimeError('存在待恢复订单，禁止因遮挡而重启浏览器。') from error
+            try:
+                blank = sys.modules['browser_session'].click_safe_blank(driver)
+            except Exception as click_error:
+                blank = {'clicked': False, 'reason': type(click_error).__name__}
+            record_cover(error, attempt, 'blank_click', blank=blank)
+            if blank['clicked']:
+                time.sleep(1)
+                try:
+                    state = export_from_progress()
+                    break
+                except sys.modules['export_one_day'].BlockedControlError as after_blank:
+                    progress = record_cover(after_blank, attempt, 'still_blocked_after_blank')
+                    if progress.get('pending'):
+                        raise RuntimeError('存在待恢复订单，禁止因遮挡而重启浏览器。') from after_blank
+            if attempt == 3:
+                raise RuntimeError('连续3轮点击空白处或重启后仍被遮挡，已停止并保留进度。') from error
+            driver = sys.modules['browser_session'].restart_browser(chrome, BASE, driver)
+            login.ensure(driver)
     print('本轮结束：', state['status'], '剩余额度：', state['remaining'], flush=True)
     if state['status'] not in {'waiting_quota', 'province_batch_done', 'day_changed', 'complete', 'complete_with_skips'}:
         raise RuntimeError('导出停止，需要检查状态：' + state['status'])

@@ -61,7 +61,7 @@ def active_port(profile):
         return None
 
 
-def connect_browser(chrome, base, existing=None):
+def connect_browser(chrome, base, existing=None, preferred_profile=None):
     from selenium import webdriver
     if existing is not None:
         try:
@@ -76,6 +76,11 @@ def connect_browser(chrome, base, existing=None):
     commands = chrome_commands()
     selected = None
     profiles = [base / 'notebook_chrome', base / 'notebook_chrome_v7']
+    if preferred_profile is not None:
+        preferred_profile = Path(preferred_profile).resolve()
+        profiles = [p for p in profiles if p.resolve() == preferred_profile]
+        if not profiles:
+            raise RuntimeError('请求连接的 Chrome 配置目录不属于剑鱼自动化，已停止。')
     occupancy = {}
     for profile in profiles:
         ports, occupied = profile_ports(commands, profile)
@@ -129,5 +134,82 @@ def connect_browser(chrome, base, existing=None):
     driver = webdriver.Chrome(options=options)
     driver.execute_cdp_cmd('Browser.setDownloadBehavior', {
         'behavior': 'allow', 'downloadPath': str(downloads.resolve())})
+    driver._jianyu_profile = str(profile.resolve())
+    driver._jianyu_port = port
     print('已连接 Chrome。请确认登录后运行预演。')
     return driver
+
+
+def restart_browser(chrome, base, driver):
+    """Only restart the verified dedicated automation Chrome profile."""
+    allowed = {(Path(base) / name).resolve() for name in ('notebook_chrome', 'notebook_chrome_v7')}
+    profile = Path(getattr(driver, '_jianyu_profile', '')).resolve()
+    port = getattr(driver, '_jianyu_port', None)
+    if profile not in allowed or not port or not endpoint(port):
+        raise RuntimeError('无法确认当前浏览器属于剑鱼自动化配置，拒绝关闭。')
+    print(f'关闭自动化 Chrome 并重新启动：{profile}', flush=True)
+    try:
+        driver.execute_cdp_cmd('Browser.close', {})
+    except Exception as error:
+        if endpoint(port):
+            raise RuntimeError('自动化 Chrome 未成功关闭，停止重试。') from error
+    deadline = time.monotonic() + 25
+    def still_occupied():
+        return profile_ports(chrome_commands(), profile)[1]
+    while (endpoint(port) or still_occupied()) and time.monotonic() < deadline:
+        time.sleep(0.5)
+    if endpoint(port) or still_occupied():
+        raise RuntimeError('自动化 Chrome 尚未释放专用配置目录，停止重试。')
+    # Chrome 释放用户数据目录后，使用原独立计划任务重新启动。
+    time.sleep(2)
+    return connect_browser(chrome, base, preferred_profile=profile)
+
+
+def click_safe_blank(driver):
+    """Click a verified non-interactive blank point in the current page/frame."""
+    point = driver.execute_script("""
+        const positions = [
+            [24, innerHeight - 24], [innerWidth - 24, innerHeight - 24],
+            [24, Math.floor(innerHeight / 2)],
+            [innerWidth - 24, Math.floor(innerHeight / 2)],
+            [Math.floor(innerWidth / 2), innerHeight - 24]
+        ];
+        for (const [x, y] of positions) {
+            if (x < 0 || y < 0) continue;
+            const element = document.elementFromPoint(x, y);
+            if (!element || element.closest(
+                'button,a,input,select,textarea,label,[role="button"],[onclick],.el-dialog'
+            )) continue;
+            if (element.children.length || element.textContent.trim()) {
+                if (!element.matches('html,body,.el-loading-mask,.v-modal')) continue;
+            }
+            const r = element.getBoundingClientRect();
+            const left = Math.max(0, r.left), right = Math.min(innerWidth, r.right);
+            const top = Math.max(0, r.top), bottom = Math.min(innerHeight, r.bottom);
+            if (right <= left || bottom <= top) continue;
+            return {element, x, y, dx: x - (left + right) / 2,
+                dy: y - (top + bottom) / 2,
+                target: `${element.tagName.toLowerCase()}#${element.id}.${String(element.className).slice(0,100)}`};
+        }
+        return null;
+    """)
+    if point is None:
+        return {'clicked': False, 'reason': '没有可确认的安全空白处'}
+    from selenium.webdriver.common.action_chains import ActionChains
+    try:
+        ActionChains(driver).move_to_element_with_offset(
+            point['element'], round(point['dx']), round(point['dy'])).perform()
+        still_blank = driver.execute_script("""
+            const element = document.elementFromPoint(arguments[1], arguments[2]);
+            return element === arguments[0] && !element.closest(
+                'button,a,input,select,textarea,label,[role="button"],[onclick],.el-dialog');
+        """, point['element'], point['x'], point['y'])
+        if not still_blank:
+            return {'clicked': False, 'reason': '空白位置已变化，已取消点击',
+                    'target': point['target'], 'x': point['x'], 'y': point['y']}
+        ActionChains(driver).click().perform()
+    except Exception as error:
+        return {'clicked': False, 'reason': type(error).__name__,
+                'target': point['target'], 'x': point['x'], 'y': point['y']}
+    return {'clicked': True, 'target': point['target'],
+            'x': point['x'], 'y': point['y']}
