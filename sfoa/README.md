@@ -28,7 +28,9 @@
 
 ## 每日自动入库
 
-现有 Windows 任务 `Jianyu-Notebook-2100` 的触发器是**每天 11:00**（任务名里的 2100 不是当前实际时间）。计划任务运行 `jianyudata_auto400/run_scheduled_notebook.py`，它调用 `nightly_job.py`。导出安全结束后，`nightly_job.py` 调用 `sfoa/sync_to_salesforce.py`，扫描新 XLSX、按唯一键 Bulk upsert，并且只有 0 失败时才更新 `D:\桌面\data\sfoa_sync_manifest.json`。再次运行时，仅处理新文件或内容变化的文件。同步失败由原计划任务日志和失败邮件流程处理；不会重新扣剑鱼导出额度。
+现有 Windows 任务 `Jianyu-Notebook-2100` 的触发器是**每天 12:05**（任务名里的 2100 不是当前实际时间）。计划任务运行 `jianyudata_auto400/run_scheduled_notebook.py`，它调用 `nightly_job.py`。导出安全结束后，`nightly_job.py` 调用 `sfoa/sync_to_salesforce.py`，扫描新 XLSX、按唯一键 Bulk upsert，并且只有 0 失败时才更新 `D:\桌面\data\sfoa_sync_manifest.json`。再次运行时，仅处理新文件或内容变化的文件。同步失败由原计划任务日志和失败邮件流程处理；不会重新扣剑鱼导出额度。
+
+自信息类型筛选更新后，新增导出与入库只保留“招标公告”整组（招标、邀标、询价、竞谈、单一、竞价、变更）及“招标结果”中的中标、成交。上传前仍按 `Publication_Category__c` 对 Excel 行进行第二次过滤，`prepare_report.json` 的 `categories_skipped` 记录排除数量。已经上传的其他类型标讯不会被此变更自动删除；如需清理历史记录，应先单独核对数量与范围。
 
 手动补传新文件（不调用剑鱼网站、不扣导出额度）：
 

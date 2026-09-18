@@ -23,7 +23,9 @@ from selenium.common.exceptions import (
 FILTER_URL = ('https://www.jianyu360.cn/page_workDesktop/work-bench/page'
               '?link=https%3A%2F%2Fwww.jianyu360.cn%2Ffront%2FdataExport%2FtoSieve')
 WORDS = {'超融合', '分布式存储', '私有云', '虚拟化'}
-VERSION = '2026-09-13-range-prefix-100-v6'
+NOTICE_TYPES = ('招标', '邀标', '询价', '竞谈', '单一', '竞价', '变更',
+                '中标', '成交')
+VERSION = '2026-09-18-selected-notice-types-v1'
 
 
 class BlockedControlError(RuntimeError):
@@ -637,10 +639,74 @@ class OneDay:
             self.text_click('立即修改')
             WebDriverWait(self.driver, 15).until(lambda _: not self.no_data_visible())
 
+    def information_type_row(self):
+        """只定位同时包含类型标题和全部选项的最小可见筛选行。"""
+        row = self.driver.execute_script('''
+            const labels=[...document.querySelectorAll('body *')].filter(e=>
+                e.children.length===0 && e.textContent.trim()==='信息类型' &&
+                e.getClientRects().length);
+            const found=[];
+            for(const label of labels) {
+                for(let p=label.parentElement, depth=0;p && depth<9;p=p.parentElement,depth++) {
+                    const text=(p.innerText||'').trim();
+                    if(text.length>1200) break;
+                    const names=[...p.querySelectorAll('*')].filter(e=>
+                        e.children.length===0 && e.getClientRects().length)
+                        .map(e=>e.textContent.trim());
+                    if(['全部','招标公告','招标结果','招标','中标','成交']
+                        .every(name=>names.includes(name))) {found.push(p);break;}
+                }
+            }
+            return found.length===1?found[0]:null;
+        ''')
+        if row is None:
+            raise RuntimeError('未唯一找到信息类型筛选行；停止，避免导出其他公告类别')
+        return row
+
+    def selected_notice_types(self, row):
+        return set(self.driver.execute_script('''
+            return [...arguments[0].querySelectorAll('.delete-close')]
+                .filter(e=>e.getClientRects().length)
+                .map(e=>e.textContent.trim()).filter(Boolean);
+        ''', row))
+
+    def notice_type_option(self, row, name):
+        option = self.driver.execute_script('''
+            const choices=[...arguments[0].querySelectorAll('*')].filter(e=>
+                e.children.length===0 && e.textContent.trim()===arguments[1] &&
+                e.getClientRects().length && !e.closest('.delete-close'));
+            return choices.length===1?choices[0]:null;
+        ''', row, name)
+        if option is None:
+            raise RuntimeError(f'信息类型“{name}”控件不唯一，停止')
+        return option
+
+    def select_notice_types(self):
+        """每次查询限定为招标公告整组及中标、成交，并核对筛选标签。"""
+        target = set(NOTICE_TYPES)
+        row = self.information_type_row()
+        current = self.selected_notice_types(row)
+        if current != target and current:
+            self.visible_click(self.notice_type_option(row, '全部'))
+            WebDriverWait(self.driver, 8).until(
+                lambda _: not self.selected_notice_types(self.information_type_row()))
+        for name in NOTICE_TYPES:
+            row = self.information_type_row()
+            if name in self.selected_notice_types(row):
+                continue
+            self.visible_click(self.notice_type_option(row, name))
+            WebDriverWait(self.driver, 8).until(
+                lambda _, expected=name: expected in self.selected_notice_types(
+                    self.information_type_row()))
+        actual = self.selected_notice_types(self.information_type_row())
+        if actual != target:
+            raise RuntimeError(f'信息类型未限定为{NOTICE_TYPES}，实际为{sorted(actual)}；未提交查询')
+
     def query_filters(self, select_regions=None, wait_query=None):
         self.close_no_data()
         self.filter_page()
         inputs = self.dates()
+        self.select_notice_types()
         if select_regions:
             select_regions(self)
         else:
@@ -659,7 +725,7 @@ class OneDay:
                 self.visible_click(checkbox.find_element(By.XPATH, "ancestor::label[1]").find_element(By.CSS_SELECTOR, '.el-checkbox__inner'))
         if not all(e.is_selected() for e in matches):
             raise RuntimeError('匹配方式未全部勾选。')
-        print(f'已设置 {self.day} 及四项匹配方式；四个关键词核对通过。', flush=True)
+        print(f'已设置 {self.day}、信息类型{NOTICE_TYPES}及四项匹配方式；四个关键词核对通过。', flush=True)
         self.filter_submit()
         if wait_query:
             wait_query(self)
@@ -667,13 +733,13 @@ class OneDay:
         WebDriverWait(self.driver, 25).until(lambda _: self.no_data_visible() or re.search(r'为您筛选到\s*\d+\s*条数据', self.body()))
         if self.no_data_visible():
             self.close_no_data()
-            self.save(count=0, status='filtered')
+            self.save(count=0, notice_types=list(NOTICE_TYPES), status='filtered')
             return 0
         found = set(map(int, re.findall(r'为您筛选到\s*(\d+)\s*条数据', self.body())))
         if len(found) != 1:
             raise RuntimeError('查询条数不一致，停止。')
         count = found.pop()
-        self.save(count=count, status='filtered')
+        self.save(count=count, notice_types=list(NOTICE_TYPES), status='filtered')
         return count
 
     def configure(self):

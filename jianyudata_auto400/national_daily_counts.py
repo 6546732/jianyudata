@@ -16,7 +16,7 @@ from selenium.webdriver.common.by import By
 
 from automatic_ui import AutomaticUI
 from browser_session import connect_browser
-from export_one_day import OneDay, WORDS
+from export_one_day import OneDay, NOTICE_TYPES, WORDS
 
 CHINA_TIME = timezone(timedelta(hours=8))
 DEFAULT_BASE = Path(r'D:\桌面\data')
@@ -24,6 +24,7 @@ CRITERIA = {
     'region': '全国',
     'keywords': sorted(WORDS),
     'match_methods': ['标题', '全文', '附件', '项目名称/标的物'],
+    'notice_types': list(NOTICE_TYPES),
 }
 
 
@@ -188,8 +189,9 @@ def main():
     parser.add_argument('--base', type=Path, default=DEFAULT_BASE)
     args = parser.parse_args()
     base = args.base.resolve()
-    checkpoint = base / 'national_daily_counts.jsonl'
-    output = base / 'national_daily_counts.xlsx'
+    # 旧统计文件使用全部信息类型；新口径另存，避免混合两种筛选条件。
+    checkpoint = base / 'national_daily_counts_selected_types.jsonl'
+    output = base / 'national_daily_counts_selected_types.xlsx'
     counter = BrowserCounter(base)
     base.mkdir(parents=True, exist_ok=True)
     lock_path = base / 'national_daily_counts.lock'

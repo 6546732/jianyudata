@@ -2,6 +2,8 @@
 
 本目录是当前定时运行版本。每天累计最多800条，沿用 `D:\桌面\data` 中的进度，保留零现金支付校验和提交前pending记录。不要同时启动旧Notebook中的长期调度。
 
+每次筛选只选择“招标公告”整组（招标、邀标、询价、竞谈、单一、竞价、变更）和“招标结果”中的中标、成交。页面选中类型无法逐项核实时，任务会在查询提交前停止，避免扣额度导出其他类型。既有进度和已下载文件不回退；上传端对旧文件也按同一类别清单过滤。
+
 导出安全结束后，同一计划任务会调用 `sfoa/sync_to_salesforce.py`，仅把新增或变化的 XLSX 明细 upsert 到 Salesforce `zihao` 沙盒。明细上传失败会写入原计划任务日志并触发失败邮件，不会重新扣剑鱼额度。增量清单在 `D:\桌面\data\sfoa_sync_manifest.json`，逐字段核对报告在 `D:\桌面\data\sfoa_upload\reconcile_report.json`。AI 标签目前只完成单条联调，未启用每日批量模型调用。
 
 ## 入口
@@ -28,7 +30,7 @@ Chrome由独立的 `Jianyu-Automation-Chrome` 计划任务启动并常驻。导�
 & 'C:\Users\Administrator\AppData\Local\Programs\Python\Python314\python.exe' .\national_daily_counts.py
 ```
 
-一次运行会从 2025-01-01 逐天查询到运行当天（北京时间），逐日核对“全国”、四个关键词和四项匹配方式，将日期及全国条数写入 `D:\桌面\data\national_daily_counts.xlsx`。不点击“立即导出”，不打开订单页，也不使用每日导出额度。每个成功日期同步记入 `D:\桌面\data\national_daily_counts.jsonl`；断线或关闭后重新执行相同命令只补未完成日期，并修复可能未写完的 Excel 文件。可用 `--end 2025-01-31` 先小范围试跑；省略 `--end` 即查询到当天。脚本复用专用 Chrome 和本机加密的登录凭据，完成后保留浏览器窗口。请勿同时手动运行每日导出任务。
+一次运行会从 2025-01-01 逐天查询到运行当天（北京时间），逐日核对“全国”、四个关键词、四项匹配方式，以及“招标公告”整组加“中标、成交”，将日期及全国条数写入 `D:\桌面\data\national_daily_counts_selected_types.xlsx`。原 `national_daily_counts.xlsx` 属于全部信息类型的旧口径，保留不改。不点击“立即导出”，不打开订单页，也不使用每日导出额度。每个成功日期同步记入 `D:\桌面\data\national_daily_counts_selected_types.jsonl`；断线或关闭后重新执行相同命令只补未完成日期，并修复可能未写完的 Excel 文件。可用 `--end 2025-01-31` 先小范围试跑；省略 `--end` 即查询到当天。脚本复用专用 Chrome 和本机加密的登录凭据，完成后保留浏览器窗口。请勿同时手动运行每日导出任务。
 
 ## 邮件与日志
 

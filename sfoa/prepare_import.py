@@ -38,7 +38,11 @@ FIELDS = [
     "website__c", "Announcement_Url_Full__c", "swordfishwebsite__c", "Source_File__c",
 ]
 AWARDED = {"中标", "成交"}
-OPEN = {"招标", "竞价", "竞谈", "询价", "磋商", "单一", "邀请", "采购意向", "需求公示", "预告"}
+OPEN = {"招标", "邀标", "竞价", "竞谈", "询价", "磋商", "单一", "邀请",
+        "变更", "采购意向", "需求公示", "预告"}
+ALLOWED_CATEGORIES = frozenset({
+    "招标", "邀标", "询价", "竞谈", "单一", "竞价", "变更", "中标", "成交",
+})
 HYPERLINK = re.compile(
     # Jianyu sometimes puts unescaped quotation marks in the visible title.
     # The target URL has no quotes; take the rest through the final quote as
@@ -173,6 +177,7 @@ def prepare(root: Path, output: Path, selected_files=None) -> dict:
     by_date: Counter = Counter()
     seen: set[str] = set()
     rows_read = rows_written = duplicates = 0
+    categories_skipped: Counter = Counter()
     with csv_path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=FIELDS, lineterminator="\r\n")
         writer.writeheader()
@@ -195,6 +200,10 @@ def prepare(root: Path, output: Path, selected_files=None) -> dict:
                         raise ValueError(f"数据行列数异常：{path} 第 {row_number} 行")
                     row = tuple(excel_value(cell, f"{path.name} 第{row_number}行 第{index}列")
                                 for index, cell in enumerate(cells, start=1))
+                    category = clean(row[6])
+                    if category not in ALLOWED_CATEGORIES:
+                        categories_skipped[category or "(空白)"] += 1
+                        continue
                     item = record(row, path.name, errors)
                     if item["Source_Key__c"] in seen:
                         duplicates += 1
@@ -208,6 +217,8 @@ def prepare(root: Path, output: Path, selected_files=None) -> dict:
     report = {
         "source_files": len(files), "rows_read": rows_read,
         "rows_written": rows_written, "duplicates_skipped": duplicates,
+        "categories_skipped": dict(categories_skipped),
+        "allowed_categories": sorted(ALLOWED_CATEGORIES),
         "warnings": dict(errors), "by_date": dict(by_date),
         "csv": str(csv_path), "csv_sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest(),
     }
