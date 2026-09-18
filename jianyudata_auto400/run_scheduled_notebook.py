@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 LOGS = Path(r'D:\桌面\data\logs')
 READ_ONLY_TEST_DATE = date(2026, 9, 19)
+READ_ONLY_TEST_PENDING = ROOT / 'read_only_test_pending.json'
 
 def alert(log, filter_only=False):
     config_file = ROOT / 'mail_config.json'
@@ -77,7 +78,9 @@ def main():
     output = LOGS / (stamp + '.ipynb')
     failed = False
     notebook = None
-    filter_only = datetime.now().date() == READ_ONLY_TEST_DATE
+    today = datetime.now().date()
+    filter_only = (today == READ_ONLY_TEST_DATE or
+                   (today > READ_ONLY_TEST_DATE and READ_ONLY_TEST_PENDING.is_file()))
     with log.open('w', encoding='utf-8', buffering=1) as stream, contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
         print('定时任务启动：', datetime.now().isoformat(),
               '只查询不导出' if filter_only else '正式Notebook', flush=True)
@@ -87,6 +90,8 @@ def main():
             if filter_only:
                 from read_only_notice_test import run as run_filter_test
                 run_filter_test()
+                # A missed/failed run stays pending; only a completed query clears it.
+                READ_ONLY_TEST_PENDING.unlink(missing_ok=True)
             else:
                 import nbformat
                 from nbclient import NotebookClient
