@@ -25,7 +25,9 @@ FILTER_URL = ('https://www.jianyu360.cn/page_workDesktop/work-bench/page'
 WORDS = {'超融合', '分布式存储', '私有云', '虚拟化'}
 NOTICE_TYPES = ('招标', '邀标', '询价', '竞谈', '单一', '竞价', '变更',
                 '中标', '成交')
-VERSION = '2026-09-18-selected-notice-types-v1'
+# 网站支持直接选择“招标公告”整组；其余只取招标结果中的中标、成交。
+NOTICE_TYPE_KEYS = ('招标公告', '招标结果_中标', '招标结果_成交')
+VERSION = '2026-09-18-selected-notice-types-v3'
 
 
 class BlockedControlError(RuntimeError):
@@ -665,38 +667,42 @@ class OneDay:
 
     def selected_notice_types(self, row):
         return set(self.driver.execute_script('''
-            return [...arguments[0].querySelectorAll('.delete-close')]
+            return [...arguments[0].querySelectorAll('#info-del .delete-box-close')]
                 .filter(e=>e.getClientRects().length)
-                .map(e=>e.textContent.trim()).filter(Boolean);
+                .map(e=>e.getAttribute('data-key')).filter(Boolean);
         ''', row))
 
-    def notice_type_option(self, row, name):
+    def notice_type_option(self, row, key):
         option = self.driver.execute_script('''
-            const choices=[...arguments[0].querySelectorAll('*')].filter(e=>
-                e.children.length===0 && e.textContent.trim()===arguments[1] &&
-                e.getClientRects().length && !e.closest('.delete-close'));
+            const group = arguments[1] === '全部' || arguments[1] === '招标公告';
+            const selector = group ? '#info-select .info-select-now'
+                                   : '#info-select span[data-value]';
+            const choices=[...arguments[0].querySelectorAll(selector)].filter(e=>
+                e.getClientRects().length &&
+                (group ? e.textContent.trim()===arguments[1]
+                       : e.getAttribute('data-value')===arguments[1]));
             return choices.length===1?choices[0]:null;
-        ''', row, name)
+        ''', row, key)
         if option is None:
-            raise RuntimeError(f'信息类型“{name}”控件不唯一，停止')
+            raise RuntimeError(f'信息类型“{key}”控件不唯一，停止')
         return option
 
     def select_notice_types(self):
         """每次查询限定为招标公告整组及中标、成交，并核对筛选标签。"""
-        target = set(NOTICE_TYPES)
+        target = set(NOTICE_TYPE_KEYS)
         row = self.information_type_row()
         current = self.selected_notice_types(row)
-        if current != target and current:
+        if current - target and current != {'全部'}:
             self.visible_click(self.notice_type_option(row, '全部'))
             WebDriverWait(self.driver, 8).until(
-                lambda _: not self.selected_notice_types(self.information_type_row()))
-        for name in NOTICE_TYPES:
+                lambda _: self.selected_notice_types(self.information_type_row()) == {'全部'})
+        for key in NOTICE_TYPE_KEYS:
             row = self.information_type_row()
-            if name in self.selected_notice_types(row):
+            if key in self.selected_notice_types(row):
                 continue
-            self.visible_click(self.notice_type_option(row, name))
+            self.visible_click(self.notice_type_option(row, key))
             WebDriverWait(self.driver, 8).until(
-                lambda _, expected=name: expected in self.selected_notice_types(
+                lambda _, expected=key: expected in self.selected_notice_types(
                     self.information_type_row()))
         actual = self.selected_notice_types(self.information_type_row())
         if actual != target:

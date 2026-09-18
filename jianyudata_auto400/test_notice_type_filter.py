@@ -5,7 +5,7 @@ from pathlib import Path
 
 from selenium.webdriver.common.by import By
 
-from export_one_day import NOTICE_TYPES, OneDay
+from export_one_day import NOTICE_TYPES, NOTICE_TYPE_KEYS, OneDay
 
 
 class FilterJob(OneDay):
@@ -27,8 +27,9 @@ class FilterJob(OneDay):
     def visible_click(self, option, wait_seconds=3):
         self.clicked.append(option)
         if option == '全部':
-            self.selected.clear()
+            self.selected = {'全部'}
         else:
+            self.selected.discard('全部')
             self.selected.add(option)
 
 
@@ -87,19 +88,25 @@ class NoticeTypeFilterTest(unittest.TestCase):
     def test_unfiltered_page_selects_only_requested_types(self):
         job = FilterJob(set())
         job.select_notice_types()
-        self.assertEqual(job.selected, set(NOTICE_TYPES))
-        self.assertEqual(job.clicked, list(NOTICE_TYPES))
+        self.assertEqual(job.selected, set(NOTICE_TYPE_KEYS))
+        self.assertEqual(job.clicked, list(NOTICE_TYPE_KEYS))
 
     def test_repeated_query_does_not_toggle_types_off(self):
-        job = FilterJob(set(NOTICE_TYPES))
+        job = FilterJob(set(NOTICE_TYPE_KEYS))
         job.select_notice_types()
         self.assertEqual(job.clicked, [])
 
-    def test_stale_other_types_are_cleared_first(self):
-        job = FilterJob({'合同', '成交'})
+    def test_all_is_replaced_by_requested_group_and_results(self):
+        job = FilterJob({'全部'})
         job.select_notice_types()
-        self.assertEqual(job.clicked, ['全部', *NOTICE_TYPES])
-        self.assertEqual(job.selected, set(NOTICE_TYPES))
+        self.assertEqual(job.clicked, list(NOTICE_TYPE_KEYS))
+        self.assertEqual(job.selected, set(NOTICE_TYPE_KEYS))
+
+    def test_stale_other_types_are_cleared_first(self):
+        job = FilterJob({'招标信用信息_合同', '招标结果_成交'})
+        job.select_notice_types()
+        self.assertEqual(job.clicked, ['全部', *NOTICE_TYPE_KEYS])
+        self.assertEqual(job.selected, set(NOTICE_TYPE_KEYS))
 
     def test_query_applies_types_before_submitting(self):
         job = QueryJob()
