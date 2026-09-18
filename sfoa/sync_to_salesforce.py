@@ -7,9 +7,11 @@ after an uncertain result is safe because Source_Key__c is a unique External ID.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
+import re
 import subprocess
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -20,6 +22,38 @@ from prepare_import import prepare
 NODE = Path(os.environ.get("SFOA_NODE", "D:/install/SOFTWARE DOWNLOAD/sf/client/bin/node.exe"))
 SF_CLI = Path(os.environ.get("SFOA_CLI", "D:/install/SOFTWARE DOWNLOAD/sf/client/bin/run.js"))
 DEFAULT_BASE = Path(r"D:\桌面\data")
+
+
+def verify_recent_upsert(csv_path: Path, target_org: str, started_at: datetime,
+                         expected_rows: int) -> bool:
+    """Confirm every external ID was modified by this run if Bulk CLI loses its JSON."""
+    with csv_path.open(newline="", encoding="utf-8") as stream:
+        keys = [row["Source_Key__c"] for row in csv.DictReader(stream)]
+    if (len(keys) != expected_rows or len(set(keys)) != expected_rows
+            or not all(re.fullmatch(r"[0-9a-f]{64}", key) for key in keys)):
+        return False
+    since = started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    environment = os.environ.copy()
+    environment["SHELL"] = "powershell"
+    for offset in range(0, len(keys), 100):
+        batch = keys[offset:offset + 100]
+        quoted = ",".join(f"'{key}'" for key in batch)
+        soql = ("SELECT COUNT() FROM bidnews__c WHERE "
+                f"Source_Key__c IN ({quoted}) AND LastModifiedDate >= {since}")
+        query = subprocess.run(
+            [str(NODE), str(SF_CLI), "data", "query", "--target-org", target_org,
+             "--query", soql, "--json"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=180, env=environment,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            result = json.loads(query.stdout)
+        except json.JSONDecodeError:
+            return False
+        if (query.returncode or result.get("status") != 0
+                or (result.get("result") or {}).get("totalSize") != len(batch)):
+            return False
+    return True
 
 
 def digest(path: Path) -> str:
@@ -88,38 +122,56 @@ def sync(base: Path = DEFAULT_BASE, target_org: str = "zihao", force: bool = Fal
             ]
             environment = os.environ.copy()
             environment["SHELL"] = "powershell"
+            started_at = datetime.now(timezone.utc)
             process = subprocess.run(
                 command, capture_output=True, text=True, encoding="utf-8",
                 errors="replace", timeout=900, env=environment,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            verified_without_cli_result = False
             try:
                 result = json.loads(process.stdout)
             except json.JSONDecodeError as error:
-                raise RuntimeError("Salesforce CLI 未返回可解析的 JSON；未推进同步进度") from error
-            job = (result.get("result") or {}).get("jobInfo") or {}
-            processed = int(job.get("numberRecordsProcessed", -1))
-            failed = int(job.get("numberRecordsFailed", -1))
-            if (process.returncode or result.get("status") != 0
-                    or job.get("state") != "JobComplete"
-                    or processed != report["rows_written"] or failed != 0):
-                raise RuntimeError(
-                    f"Salesforce 批量上传未通过核验：job={job.get('id')} "
-                    f"state={job.get('state')} processed={processed} failed={failed}；"
-                    "未推进同步进度，请检查 Bulk Job"
-                )
-            job_id = job["id"]
+                if not verify_recent_upsert(output / "bidnews_upsert.csv", target_org,
+                                            started_at, report["rows_written"]):
+                    raise RuntimeError(
+                        "Salesforce CLI 未返回 JSON，且无法核实本次所有外部键均已更新；"
+                        f"exit={process.returncode} stderr_chars={len(process.stderr)}；"
+                        "未推进同步进度") from error
+                job_id = None
+                verified_without_cli_result = True
+            else:
+                job = (result.get("result") or {}).get("jobInfo") or {}
+                processed = int(job.get("numberRecordsProcessed", -1))
+                failed = int(job.get("numberRecordsFailed", -1))
+                if (process.returncode or result.get("status") != 0
+                        or job.get("state") != "JobComplete"
+                        or processed != report["rows_written"] or failed != 0):
+                    raise RuntimeError(
+                        f"Salesforce 批量上传未通过核验：job={job.get('id')} "
+                        f"state={job.get('state')} processed={processed} failed={failed}；"
+                        "未推进同步进度，请检查 Bulk Job"
+                    )
+                job_id = job["id"]
         else:
             job_id = None
+            verified_without_cli_result = False
         for path in pending:
             manifest["files"][str(path.resolve())] = hashes[str(path.resolve())]
         manifest["last_job_id"] = job_id
         manifest["last_synced_at"] = datetime.now(timezone.utc).isoformat()
+        if verified_without_cli_result:
+            manifest["last_reconciliation"] = {
+                "method": "all_external_ids_modified_after_bulk_submit",
+                "files": len(pending), "rows": report["rows_written"],
+                "verified_at": manifest["last_synced_at"],
+            }
         temporary = manifest_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(manifest_path)
         return {"status": "uploaded", "files": len(pending),
                 "rows": report["rows_written"], "job_id": job_id,
+                "verified_without_cli_result": verified_without_cli_result,
                 "duplicates_in_batch": report["duplicates_skipped"]}
 
 

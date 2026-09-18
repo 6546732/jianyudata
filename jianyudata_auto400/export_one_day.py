@@ -149,6 +149,7 @@ class OneDay:
 
     def export_entry(self):
         """区分固定结果栏与页面内副本，并合并同一按钮的内部文字。"""
+        self.release_finished_query_mask()
         # 已由现场诊断确认：底部栏含数量、修改条件和正式导出按钮。
         footers = [e for e in self.driver.find_elements(By.CSS_SELECTOR, '.data-footer-main')
                    if e.is_displayed()]
@@ -210,6 +211,49 @@ class OneDay:
         path.write_text(json.dumps(diagnostic, ensure_ascii=False, indent=2), encoding='utf-8')
         raise RuntimeError(f'导出入口仍有{len(choices)}个候选，尚未点击；控件结构已保存到{path}')
 
+    def release_finished_query_mask(self):
+        """只处理查询结束后仍截获点击的退出动画遮罩。"""
+        if self.state.get('count') is None:
+            return
+        leaving = self.driver.execute_script('''
+            return [...document.querySelectorAll('.el-loading-mask')].some(e=>
+                e.classList.contains('el-loading-fade-leave') &&
+                getComputedStyle(e).display!=='none' &&
+                getComputedStyle(e).pointerEvents!=='none');
+        ''')
+        if leaving:
+            try:
+                WebDriverWait(self.driver, 4, poll_frequency=0.2).until(lambda d: not d.execute_script('''
+                    return [...document.querySelectorAll('.el-loading-mask')].some(e=>
+                        e.classList.contains('el-loading-fade-leave') &&
+                        getComputedStyle(e).display!=='none' &&
+                        getComputedStyle(e).pointerEvents!=='none');
+                '''))
+            except TimeoutException:
+                pass
+        cleared = self.driver.execute_script('''
+            const q=window.__autoQuery;
+            if (!q || q.pending!==0 || q.done<1 || q.status!==200 ||
+                Date.now()-q.finished<3000) return 0;
+            const count=String(arguments[0]);
+            const result=[...document.querySelectorAll('.dataExNum')]
+                .filter(e=>e.getClientRects().length).map(e=>e.textContent.trim());
+            if (!result.length || result.some(n=>n!==count)) return 0;
+            let cleared=0;
+            for(const mask of document.querySelectorAll('.el-loading-mask')) {
+                const classes=mask.classList;
+                if(classes.contains('el-loading-fade-leave') &&
+                   classes.contains('el-loading-fade-leave-active') &&
+                   getComputedStyle(mask).pointerEvents!=='none') {
+                    mask.style.pointerEvents='none';
+                    cleared++;
+                }
+            }
+            return cleared;
+        ''', self.state['count'])
+        if cleared:
+            print(f'查询已完成；清除{cleared}个残留加载遮罩的点击拦截。', flush=True)
+
     def visible_click(self, element, wait_seconds=3):
         """先滚动并检查真实命中位置；不执行JS click，不重复提交点击。"""
         self.driver.execute_script(
@@ -265,6 +309,7 @@ class OneDay:
 
     def filter_submit(self):
         """只选与“重置”同组的确定，排除日期行上的确定。"""
+        self.release_finished_query_mask()
         resets = [e for e in self.driver.find_elements(By.XPATH, "//button[normalize-space(.)='重置']")
                   if e.is_displayed()]
         if len(resets) != 1:

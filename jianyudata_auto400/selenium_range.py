@@ -108,7 +108,9 @@ class SeleniumBackend:
             job = self.job
         else:
             job = OneDay(self.driver, day, self.base / 'batch_state', False)
-            job.state_path = self.base / 'batch_state' / 'preview.json'
+        # submit() 会把同一个 job 的状态路径切到正式批次文件；
+        # 同一天后续省份查询必须切回预览文件，不能改写已导出的批次记录。
+        job.state_path = self.base / 'batch_state' / 'preview.json'
         self.job, self.selection = job, (day, list(regions))
         return job.query_filters(lambda j: self.ui.select_regions(j, regions), self.ui.wait_query)
 
