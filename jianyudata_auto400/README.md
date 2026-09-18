@@ -1,4 +1,4 @@
-# 每晚定时执行Jupyter导出
+# 每日定时执行Jupyter导出
 
 本目录是当前定时运行版本。每天累计最多800条，沿用 `D:\桌面\data` 中的进度，保留零现金支付校验和提交前pending记录。不要同时启动旧Notebook中的长期调度。
 
@@ -7,14 +7,14 @@
 ## 入口
 
 - `run_scheduled_notebook.py`：Windows计划任务入口，启动Jupyter内核执行 `NIGHTLY_2100.ipynb`，每次只运行一轮。
-- `nightly_job.py`：加载 `START_AUTO.ipynb` 中的内嵌程序，复用Chrome登录，连接最多尝试3次。登录失效时停止并提醒，不等待交互输入。
+- `nightly_job.py`：优先加载本目录独立模块，缺失时回退到 `START_AUTO.ipynb` 内嵌程序，连接最多尝试3次。登录失效时使用本机加密凭据尝试密码登录；需验证码时停止并提醒。
 - `START_AUTO.ipynb`：原交互Notebook，已清除输出。其手动调度时间及400条配置是旧入口，不用于每晚800条任务。
 - `setup_mail.ps1`：在本机输入Google应用专用密码，以当前Windows用户加密保存；不会发送测试邮件。
 - `setup_jianyu_login.ps1`：在本机输入剑鱼账号和密码，以当前Windows用户加密保存；登录仍有效时不会填写，登录失效时自动尝试密码登录。
 
 安装依赖：`python -m pip install -r requirements.txt`。
 
-Windows任务计划程序运行 `pythonw.exe`，参数是本目录 `run_scheduled_notebook.py` 的绝对路径，起始目录设为本目录。选择仅用户登录时运行、错过后补跑、已有实例时不启动新实例。当前执行时间为每天11:00。任务时区为电脑本地时区，应设置为北京时间。电脑接电禁止自动睡眠，允许关屏和锁屏；不要注销用户。
+Windows任务计划程序运行 `pythonw.exe`，参数是本目录 `run_scheduled_notebook.py` 的绝对路径，起始目录设为本目录。选择仅用户登录时运行、错过后补跑、已有实例时不启动新实例。当前执行时间为每天北京时间12:05，Chrome启动提前到12:04。已有任务可运行 `update_schedule_1205.ps1` 同步时间，其他触发器及启动配置保持不变；仅拉取GitHub代码不会修改本机任务时间。电脑接电禁止自动睡眠，允许关屏和锁屏；不要注销用户。
 
 Chrome由独立的 `Jianyu-Automation-Chrome` 计划任务启动并常驻。导出Notebook只连接该浏览器；导出成功或异常退出均不关闭整个Chrome。程序仍会关闭自己创建并已经完成的临时订单标签页。
 
@@ -44,4 +44,4 @@ Chrome由独立的 `Jianyu-Automation-Chrome` 计划任务启动并常驻。导�
 
 在 PowerShell 运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\setup_jianyu_login.ps1`，按提示输入剑鱼账号和密码。生成的 `jianyu_credential.xml` 只能由当前 Windows 用户解密，并被 `.gitignore` 排除。若网站要求短信验证码、滑块或扫码，自动登录会停止并触发失败提醒，不会反复尝试。
 
-本次版本未运行实际导出或邮件发送测试。
+2026-09-18：已使用本地加密凭据验证真实自动登录成功，并验证登录状态有效时直接返回；本次测试未运行导出或发送邮件。登录流程支持首页登录按钮、自动出现的登录弹窗、两阶段密码入口，仅检查当前导航窗口，避免旧筛选页误判。网站强制验证码时仍需人工处理。
