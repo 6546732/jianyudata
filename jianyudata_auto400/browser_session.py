@@ -61,7 +61,7 @@ def active_port(profile):
         return None
 
 
-def connect_browser(chrome, base, existing=None, preferred_profile=None):
+def connect_browser(chrome, base, existing=None, preferred_profile=None, chromedriver_path=None):
     from selenium import webdriver
     if existing is not None:
         try:
@@ -131,7 +131,14 @@ def connect_browser(chrome, base, existing=None, preferred_profile=None):
     options = webdriver.ChromeOptions()
     options.binary_location = str(chrome)
     options.debugger_address = f'127.0.0.1:{port}'
-    driver = webdriver.Chrome(options=options)
+    if chromedriver_path is None:
+        driver = webdriver.Chrome(options=options)
+    else:
+        from selenium.webdriver.chrome.service import Service
+        path = Path(chromedriver_path)
+        if not path.is_file():
+            raise RuntimeError(f'指定的 ChromeDriver 不存在：{path}')
+        driver = webdriver.Chrome(service=Service(str(path)), options=options)
     driver.execute_cdp_cmd('Browser.setDownloadBehavior', {
         'behavior': 'allow', 'downloadPath': str(downloads.resolve())})
     driver._jianyu_profile = str(profile.resolve())
