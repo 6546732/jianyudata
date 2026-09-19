@@ -1,6 +1,6 @@
 # 更新已存在的任务，不创建新任务，也不立即运行导出。
 $ErrorActionPreference = 'Stop'
-$times = @{'Jianyu-Automation-Chrome'='12:04:00+08:00'; 'Jianyu-Notebook-2100'='12:05:00+08:00'}
+$times = @{'Jianyu-Automation-Chrome'='13:59:00+08:00'; 'Jianyu-Notebook-2100'='14:00:00+08:00'}
 # 先验证两个任务，避免任务缺失时只修改一个。
 $tasks = @{}
 foreach ($name in $times.Keys) {

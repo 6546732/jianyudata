@@ -16,7 +16,7 @@
 
 安装依赖：`python -m pip install -r requirements.txt`。
 
-Windows任务计划程序运行 `pythonw.exe`，参数是本目录 `run_scheduled_notebook.py` 的绝对路径，起始目录设为本目录。选择仅用户登录时运行、错过后补跑、已有实例时不启动新实例。当前执行时间为每天北京时间12:05，Chrome启动提前到12:04。已有任务可运行 `update_schedule_1205.ps1` 同步时间，其他触发器及启动配置保持不变；仅拉取GitHub代码不会修改本机任务时间。电脑接电禁止自动睡眠，允许关屏和锁屏；不要注销用户。
+Windows任务计划程序运行 `pythonw.exe`，参数是本目录 `run_scheduled_notebook.py` 的绝对路径，起始目录设为本目录。选择仅用户登录时运行、错过后补跑、已有实例时不启动新实例。当前执行时间为每天下午14:00，Chrome启动提前到13:59。已有任务可运行 `update_schedule_1400.ps1` 同步时间，其他触发器及启动配置保持不变；仅拉取GitHub代码不会修改本机任务时间。电脑接电禁止自动睡眠，允许关屏和锁屏；不要注销用户。
 
 Chrome由独立的 `Jianyu-Automation-Chrome` 计划任务启动并常驻。导出Notebook只连接该浏览器；导出成功或异常退出均不关闭整个Chrome。程序仍会关闭自己创建并已经完成的临时订单标签页。
 

@@ -6,16 +6,14 @@ import smtplib
 import ssl
 import subprocess
 import traceback
-from datetime import date, datetime
+from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 LOGS = Path(r'D:\桌面\data\logs')
-READ_ONLY_TEST_DATE = date(2026, 9, 19)
-READ_ONLY_TEST_PENDING = ROOT / 'read_only_test_pending.json'
 
-def alert(log, filter_only=False):
+def alert(log):
     config_file = ROOT / 'mail_config.json'
     config = json.loads(config_file.read_text(encoding='utf-8')) if config_file.exists() else {}
     host = config.get('host') or os.environ.get('SMTP_HOST')
@@ -40,9 +38,8 @@ def alert(log, filter_only=False):
         raise RuntimeError('SMTP授权信息尚未配置，邮件未发送')
     message = EmailMessage()
     message['From'], message['To'] = sender, 'zihao.zhang@smartx.com'
-    task_name = '剑鱼只查询测试' if filter_only else '剑鱼自动导出'
-    message['Subject'] = task_name + '失败：' + datetime.now().strftime('%Y-%m-%d %H:%M')
-    message.set_content(f'{task_name}未完成，完整日志见附件：{log.name}\n程序没有自动重试导出扣除。\n')
+    message['Subject'] = '剑鱼自动导出失败：' + datetime.now().strftime('%Y-%m-%d %H:%M')
+    message.set_content(f'剑鱼自动导出未完成，完整日志见附件：{log.name}\n程序没有自动重试导出扣除。\n')
     message.add_attachment(log.read_text(encoding='utf-8', errors='replace'),
                            subtype='plain', filename=log.name)
     configured = config.get('security', 'ssl')
@@ -78,32 +75,22 @@ def main():
     output = LOGS / (stamp + '.ipynb')
     failed = False
     notebook = None
-    today = datetime.now().date()
-    filter_only = (today == READ_ONLY_TEST_DATE or
-                   (today > READ_ONLY_TEST_DATE and READ_ONLY_TEST_PENDING.is_file()))
     with log.open('w', encoding='utf-8', buffering=1) as stream, contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
-        print('定时任务启动：', datetime.now().isoformat(),
-              '只查询不导出' if filter_only else '正式Notebook', flush=True)
+        print('定时任务启动：', datetime.now().isoformat(), '正式Notebook', flush=True)
         try:
             if Path(r'D:\桌面\data\daily_scheduler.lock').exists():
                 raise RuntimeError('旧Notebook调度锁仍存在，请先停止旧调度；本次不启动第二个导出任务')
-            if filter_only:
-                from read_only_notice_test import run as run_filter_test
-                run_filter_test()
-                # A missed/failed run stays pending; only a completed query clears it.
-                READ_ONLY_TEST_PENDING.unlink(missing_ok=True)
-            else:
-                import nbformat
-                from nbclient import NotebookClient
-                notebook = nbformat.read(ROOT / 'NIGHTLY_2100.ipynb', as_version=4)
-                NotebookClient(notebook, timeout=7200, kernel_name='python3',
-                               resources={'metadata': {'path': str(ROOT)}}).execute()
+            import nbformat
+            from nbclient import NotebookClient
+            notebook = nbformat.read(ROOT / 'NIGHTLY_2100.ipynb', as_version=4)
+            NotebookClient(notebook, timeout=7200, kernel_name='python3',
+                           resources={'metadata': {'path': str(ROOT)}}).execute()
         except Exception:
             failed = True
             traceback.print_exc()
             stream.flush()
             try:
-                alert(log, filter_only=filter_only)
+                alert(log)
                 print('失败提醒邮件已发送')
             except Exception as error:
                 print('邮件未发送：', type(error).__name__, str(error))
