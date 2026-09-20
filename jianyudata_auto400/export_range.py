@@ -1,10 +1,38 @@
 """按日期、地区顺序调度。后端负责页面操作；本模块不依赖 Selenium。"""
 import json
+import msvcrt
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 # 拼音顺序；实际地区以网站返回的完整列表为准，使用此表排序。
 PROVINCES = '安徽 澳门 北京 重庆 福建 甘肃 广东 广西 贵州 海南 河北 黑龙江 河南 湖北 湖南 江苏 江西 吉林 辽宁 内蒙古 宁夏 青海 山东 上海 山西 陕西 四川 台湾 天津 香港 新疆 西藏 云南 浙江'.split()
+
+
+def acquire_run_lock(path):
+    """取得由 Windows 内核维护的非阻塞锁；进程退出后锁会自动释放。"""
+    path = Path(path)
+    handle = path.open('a+b')
+    try:
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b'0')
+            handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return handle
+    except OSError as error:
+        handle.close()
+        raise RuntimeError('已有真实运行中的导出任务，不启动第二个任务。') from error
+
+
+def release_run_lock(handle, path):
+    """释放内核锁并清理仅作定位用途的锁文件。"""
+    try:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        handle.close()
+        Path(path).unlink(missing_ok=True)
 
 
 def province_key(name):
@@ -89,8 +117,7 @@ class ExportRange:
         self.save()
 
     def run(self):
-        with self.lock.open('x', encoding='utf-8') as handle:
-            handle.write('运行中；仅在确认旧进程结束后清理此锁')
+        lock_handle = acquire_run_lock(self.lock)
         try:
             self._mail_attempted = set()
             # 在锁内重新加载，避免同一进程预先创建的第二个任务覆盖进度。
@@ -102,7 +129,7 @@ class ExportRange:
             self.state.setdefault('notifications', [])
             return self._run()
         finally:
-            self.lock.unlink(missing_ok=True)
+            release_run_lock(lock_handle, self.lock)
 
     def _run(self):
         if self.confirm and self.notifier is None:

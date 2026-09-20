@@ -12,6 +12,8 @@ from pathlib import Path
 from uuid import uuid4
 from zipfile import ZipFile, BadZipFile
 
+from export_range import acquire_run_lock, release_run_lock
+
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
@@ -938,11 +940,7 @@ class OneDay:
 def export_one_day(driver, day='2025-01-02', base=r'D:\桌面\data', confirm=False):
     """confirm=False：运行至结算校验后停止；True：允许扣除免费条数。"""
     job = OneDay(driver, day, base, confirm)
-    try:
-        with job.lock_path.open('x', encoding='utf-8') as lock:
-            lock.write('单日导出运行中；确认旧任务停止后方可删除此锁。')
-    except FileExistsError:
-        raise RuntimeError('已有单日任务运行锁，不启动第二个任务。')
+    lock_handle = acquire_run_lock(job.lock_path)
     try:
         return job.execute()
     except Exception as error:
@@ -953,4 +951,4 @@ def export_one_day(driver, day='2025-01-02', base=r'D:\桌面\data', confirm=Fal
             pass
         raise
     finally:
-        job.lock_path.unlink(missing_ok=True)
+        release_run_lock(lock_handle, job.lock_path)
