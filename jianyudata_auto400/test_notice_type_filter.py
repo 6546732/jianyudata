@@ -84,6 +84,39 @@ class QueryJob(OneDay):
         self.state.update(changes)
 
 
+class RetrySwitch:
+    def default_content(self):
+        pass
+
+
+class RetryDriver:
+    def __init__(self):
+        self.switch_to = RetrySwitch()
+        self._jianyu_filter_handle = 'filter'
+        self.urls = []
+
+    def get(self, url):
+        self.urls.append(url)
+
+
+class DateRetryJob(OneDay):
+    def __init__(self):
+        self.driver = RetryDriver()
+        self.attempts = 0
+
+    def reauthenticate_if_needed(self):
+        return False
+
+    def _set_dates_once(self):
+        self.attempts += 1
+        if self.attempts == 1:
+            raise RuntimeError('未找到唯一的一对日期输入框，需要核实日期控件。')
+        return ['start', 'end']
+
+    def find_page(self, predicate, timeout=25, window_filter=None):
+        return True
+
+
 class NoticeTypeFilterTest(unittest.TestCase):
     def test_unfiltered_page_selects_only_requested_types(self):
         job = FilterJob(set())
@@ -120,6 +153,12 @@ class NoticeTypeFilterTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '类型未确认'):
             job.query_filters(lambda _: job.events.append('regions'))
         self.assertEqual(job.events, ['dates', 'types'])
+
+    def test_transient_missing_date_pair_refreshes_and_retries(self):
+        job = DateRetryJob()
+        self.assertEqual(job.dates(), ['start', 'end'])
+        self.assertEqual(job.attempts, 2)
+        self.assertEqual(len(job.driver.urls), 1)
 
 
 if __name__ == '__main__':

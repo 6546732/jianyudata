@@ -594,7 +594,8 @@ class OneDay:
                 continue
             except (StaleElementReferenceException, TimeoutException, RuntimeError) as error:
                 retryable = (isinstance(error, (StaleElementReferenceException, TimeoutException))
-                             or str(error).startswith('未识别到 Element UI 单日历'))
+                             or str(error).startswith('未识别到 Element UI 单日历')
+                             or str(error).startswith('未找到唯一的一对日期输入框'))
                 if not retryable:
                     raise
                 if attempt == 2:
