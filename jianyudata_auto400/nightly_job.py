@@ -8,9 +8,11 @@ import time
 import types
 from pathlib import Path
 from datetime import datetime
+from selenium.common.exceptions import WebDriverException
 
 ROOT = Path(__file__).resolve().parent
 BASE = Path(r'D:\桌面\data')
+MAX_RECOVERY_ATTEMPTS = 10
 
 
 def load_login():
@@ -73,14 +75,14 @@ def run():
     if chrome is None:
         raise RuntimeError('未找到Chrome')
     driver = None
-    for attempt in range(1, 4):
+    for attempt in range(1, MAX_RECOVERY_ATTEMPTS + 1):
         try:
-            print(f'连接浏览器：第{attempt}/3次', flush=True)
+            print(f'连接浏览器：第{attempt}/{MAX_RECOVERY_ATTEMPTS}次', flush=True)
             driver = sys.modules['browser_session'].connect_browser(chrome, BASE, existing=driver)
             break
         except Exception as error:
             print('连接失败：', type(error).__name__, flush=True)
-            if attempt == 3:
+            if attempt == MAX_RECOVERY_ATTEMPTS:
                 raise
             time.sleep(30)
     # 登录仍有效时不会填写；失效时才使用本机加密保存的账号密码。
@@ -96,51 +98,83 @@ def run():
             driver, base=str(BASE), start='2025-01-03', end=None,
             confirm=True, daily_limit=800, strategy='prefix')
 
-    def record_cover(error, attempt, phase, blank=None):
-        progress = json.loads((BASE / 'range_progress.json').read_text(encoding='utf-8'))
+    def read_progress():
+        path = BASE / 'range_progress.json'
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text(encoding='utf-8'))
+
+    def record_recovery(error, attempt, phase, blank=None):
+        progress = read_progress()
         record = {
             'time': datetime.now().astimezone().isoformat(),
-            'attempt': attempt, 'max_attempts': 3, 'phase': phase,
+            'attempt': attempt, 'max_attempts': MAX_RECOVERY_ATTEMPTS, 'phase': phase,
             'date': progress.get('current_date'),
             'status': progress.get('status'),
             'remaining': progress.get('remaining'),
             'pending': bool(progress.get('pending')),
-            'control': error.control, 'cover': error.cover,
+            'error_type': type(error).__name__,
+            'error': str(error),
         }
+        if isinstance(error, sys.modules['export_one_day'].BlockedControlError):
+            record['control'] = error.control
+            record['cover'] = error.cover
         if blank is not None:
             record['blank_click'] = blank
-        cover_log = BASE / 'logs' / 'cover_retries.jsonl'
-        cover_log.parent.mkdir(parents=True, exist_ok=True)
-        with cover_log.open('a', encoding='utf-8') as handle:
+        recovery_log = BASE / 'logs' / 'browser_retries.jsonl'
+        recovery_log.parent.mkdir(parents=True, exist_ok=True)
+        with recovery_log.open('a', encoding='utf-8') as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + '\n')
-        print(f'遮挡记录 {attempt}/3：{record}', flush=True)
+        print(f'页面恢复记录 {attempt}/{MAX_RECOVERY_ATTEMPTS}：{record}', flush=True)
         return progress
 
-    for attempt in range(1, 4):
+    recoverable = (
+        sys.modules['export_one_day'].BlockedControlError,
+        sys.modules['export_one_day'].RecoverablePageError,
+        WebDriverException,
+    )
+    for attempt in range(1, MAX_RECOVERY_ATTEMPTS + 1):
         try:
             state = export_from_progress()
             break
-        except sys.modules['export_one_day'].BlockedControlError as error:
-            progress = record_cover(error, attempt, 'first_block')
+        except recoverable as error:
+            blocked = isinstance(error, sys.modules['export_one_day'].BlockedControlError)
+            progress = record_recovery(
+                error, attempt, 'control_blocked' if blocked else 'page_or_window_incomplete')
             if progress.get('pending'):
-                raise RuntimeError('存在待恢复订单，禁止因遮挡而重启浏览器。') from error
-            try:
-                blank = sys.modules['browser_session'].click_safe_blank(driver)
-            except Exception as click_error:
-                blank = {'clicked': False, 'reason': type(click_error).__name__}
-            record_cover(error, attempt, 'blank_click', blank=blank)
-            if blank['clicked']:
-                time.sleep(1)
+                raise RuntimeError('存在待恢复订单，禁止自动重启浏览器，以免重复扣额。') from error
+            if blocked:
                 try:
-                    state = export_from_progress()
-                    break
-                except sys.modules['export_one_day'].BlockedControlError as after_blank:
-                    progress = record_cover(after_blank, attempt, 'still_blocked_after_blank')
-                    if progress.get('pending'):
-                        raise RuntimeError('存在待恢复订单，禁止因遮挡而重启浏览器。') from after_blank
-            if attempt == 3:
-                raise RuntimeError('连续3轮点击空白处或重启后仍被遮挡，已停止并保留进度。') from error
-            driver = sys.modules['browser_session'].restart_browser(chrome, BASE, driver)
+                    blank = sys.modules['browser_session'].click_safe_blank(driver)
+                except Exception as click_error:
+                    blank = {'clicked': False, 'reason': type(click_error).__name__}
+                record_recovery(error, attempt, 'blank_click', blank=blank)
+                if blank['clicked']:
+                    time.sleep(1)
+                    try:
+                        state = export_from_progress()
+                        break
+                    except recoverable as after_blank:
+                        progress = record_recovery(after_blank, attempt, 'still_failed_after_blank')
+                        if progress.get('pending'):
+                            raise RuntimeError(
+                                '存在待恢复订单，禁止自动重启浏览器，以免重复扣额。') from after_blank
+            if attempt == MAX_RECOVERY_ATTEMPTS:
+                raise RuntimeError(
+                    f'连续{MAX_RECOVERY_ATTEMPTS}轮上下查找、点击空白处或重启后仍失败，'
+                    '已停止并保留进度。') from error
+            try:
+                driver = sys.modules['browser_session'].restart_browser(chrome, BASE, driver)
+            except Exception as restart_error:
+                record_recovery(restart_error, attempt, 'browser_restart_failed')
+                if '拒绝关闭' in str(restart_error) or '拒绝强制关闭' in str(restart_error):
+                    raise
+                if attempt == MAX_RECOVERY_ATTEMPTS:
+                    raise RuntimeError(
+                        f'连续{MAX_RECOVERY_ATTEMPTS}轮仍无法重新启动专用 Chrome，已停止。') \
+                        from restart_error
+                time.sleep(15)
+                continue
             login.ensure(driver)
     print('本轮结束：', state['status'], '剩余额度：', state['remaining'], flush=True)
     if state['status'] not in {'waiting_quota', 'province_batch_done', 'day_changed', 'complete', 'complete_with_skips'}:

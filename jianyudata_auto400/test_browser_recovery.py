@@ -29,6 +29,30 @@ class BrowserRecoveryTests(unittest.TestCase):
             driver.execute_cdp_cmd.assert_called_once_with('Browser.close', {})
             connect.assert_called_once_with('chrome.exe', directory, preferred_profile=profile)
 
+    def test_starts_verified_profile_again_after_browser_has_exited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = (Path(directory) / 'notebook_chrome_v7').resolve()
+            driver = Mock(_jianyu_profile=str(profile), _jianyu_port=7003)
+            replacement = Mock()
+            with (patch.object(browser_session, 'endpoint', return_value=False),
+                  patch.object(browser_session, 'chrome_commands', return_value=[]),
+                  patch.object(browser_session, 'profile_ports', return_value=([], False)),
+                  patch.object(browser_session, 'connect_browser', return_value=replacement) as connect):
+                self.assertIs(browser_session.restart_browser('chrome.exe', directory, driver), replacement)
+            driver.execute_cdp_cmd.assert_not_called()
+            connect.assert_called_once_with('chrome.exe', directory, preferred_profile=profile)
+
+    def test_does_not_force_close_dead_port_with_occupied_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = (Path(directory) / 'notebook_chrome').resolve()
+            driver = Mock(_jianyu_profile=str(profile), _jianyu_port=9222)
+            with (patch.object(browser_session, 'endpoint', return_value=False),
+                  patch.object(browser_session, 'chrome_commands', return_value=['chrome command']),
+                  patch.object(browser_session, 'profile_ports', return_value=([9222], True))):
+                with self.assertRaisesRegex(RuntimeError, '仍被占用'):
+                    browser_session.restart_browser('chrome.exe', directory, driver)
+            driver.execute_cdp_cmd.assert_not_called()
+
     def test_no_blank_point_means_no_click(self):
         driver = Mock()
         driver.execute_script.return_value = None

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from selenium.webdriver.common.by import By
 
-from export_one_day import NOTICE_TYPES, NOTICE_TYPE_KEYS, OneDay
+from export_one_day import NOTICE_TYPES, NOTICE_TYPE_KEYS, OneDay, RecoverablePageError
 
 
 class FilterJob(OneDay):
@@ -117,6 +117,23 @@ class DateRetryJob(OneDay):
         return True
 
 
+class ScanDriver:
+    def __init__(self, appear_after=None):
+        self.appear_after = appear_after
+        self.lookups = 0
+        self.scrolls = []
+        self.element = type('Element', (), {'is_displayed': lambda self: True})()
+
+    def find_elements(self, by, locator):
+        self.lookups += 1
+        if self.appear_after is not None and self.lookups >= self.appear_after:
+            return [self.element]
+        return []
+
+    def execute_script(self, script, ratio):
+        self.scrolls.append(ratio)
+
+
 class NoticeTypeFilterTest(unittest.TestCase):
     def test_unfiltered_page_selects_only_requested_types(self):
         job = FilterJob(set())
@@ -159,6 +176,19 @@ class NoticeTypeFilterTest(unittest.TestCase):
         self.assertEqual(job.dates(), ['start', 'end'])
         self.assertEqual(job.attempts, 2)
         self.assertEqual(len(job.driver.urls), 1)
+
+    def test_unique_scans_page_until_control_appears(self):
+        job = OneDay.__new__(OneDay)
+        job.driver = ScanDriver(appear_after=4)
+        self.assertIs(job.unique(By.ID, 'target'), job.driver.element)
+        self.assertEqual(job.driver.scrolls, [0, 0.25, 0.5])
+
+    def test_unique_reports_recoverable_error_after_full_scan(self):
+        job = OneDay.__new__(OneDay)
+        job.driver = ScanDriver()
+        with self.assertRaises(RecoverablePageError):
+            job.unique(By.ID, 'target')
+        self.assertEqual(job.driver.scrolls, [0, 0.25, 0.5, 0.75, 1])
 
 
 if __name__ == '__main__':

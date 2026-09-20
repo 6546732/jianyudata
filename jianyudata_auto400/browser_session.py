@@ -152,8 +152,16 @@ def restart_browser(chrome, base, driver):
     allowed = {(Path(base) / name).resolve() for name in ('notebook_chrome', 'notebook_chrome_v7')}
     profile = Path(getattr(driver, '_jianyu_profile', '')).resolve()
     port = getattr(driver, '_jianyu_port', None)
-    if profile not in allowed or not port or not endpoint(port):
+    if profile not in allowed or not port:
         raise RuntimeError('无法确认当前浏览器属于剑鱼自动化配置，拒绝关闭。')
+    # 标签页或 ChromeDriver 会话断开时，调试端口可能已经消失。只要专用
+    # profile 没有被残留 Chrome 占用，就可直接重新启动；绝不关闭普通 Chrome。
+    occupied = profile_ports(chrome_commands(), profile)[1]
+    if not endpoint(port):
+        if occupied:
+            raise RuntimeError('专用 Chrome 调试端口失效但配置目录仍被占用，拒绝强制关闭。')
+        print(f'自动化 Chrome 已退出，重新启动：{profile}', flush=True)
+        return connect_browser(chrome, base, preferred_profile=profile)
     print(f'关闭自动化 Chrome 并重新启动：{profile}', flush=True)
     try:
         driver.execute_cdp_cmd('Browser.close', {})

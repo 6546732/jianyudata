@@ -37,6 +37,10 @@ class BlockedControlError(RuntimeError):
         super().__init__(f'{control}仍被{cover}遮挡，未强制点击。')
 
 
+class RecoverablePageError(RuntimeError):
+    """页面、窗口或控件暂时不完整；未进入不允许重试的扣额阶段。"""
+
+
 def calendar_month(text):
     year = re.search(r'(\d{4})\s*年', text)
     month = re.search(r'(\d{1,2})\s*月', text)
@@ -144,7 +148,19 @@ class OneDay:
     def unique(self, by, locator):
         matches = [e for e in self.driver.find_elements(by, locator) if e.is_displayed()]
         if len(matches) != 1:
-            raise RuntimeError(f'控件不是唯一匹配（{len(matches)}）：{locator}')
+            # 某些控件在滚动到附近后才由页面脚本显示；按从上到下扫描一次。
+            for ratio in (0, 0.25, 0.5, 0.75, 1):
+                self.driver.execute_script('''
+                    const root=document.scrollingElement || document.documentElement;
+                    window.scrollTo(0, Math.max(0, (root.scrollHeight-innerHeight)*arguments[0]));
+                ''', ratio)
+                time.sleep(0.15)
+                matches = [e for e in self.driver.find_elements(by, locator) if e.is_displayed()]
+                if len(matches) == 1:
+                    break
+        if len(matches) != 1:
+            raise RecoverablePageError(
+                f'上下扫描后控件仍不是唯一匹配（{len(matches)}）：{locator}')
         return matches[0]
 
     def text_click(self, text):
@@ -157,6 +173,17 @@ class OneDay:
         # 已由现场诊断确认：底部栏含数量、修改条件和正式导出按钮。
         footers = [e for e in self.driver.find_elements(By.CSS_SELECTOR, '.data-footer-main')
                    if e.is_displayed()]
+        if not footers:
+            for ratio in (0, 0.25, 0.5, 0.75, 1):
+                self.driver.execute_script('''
+                    const root=document.scrollingElement || document.documentElement;
+                    window.scrollTo(0, Math.max(0, (root.scrollHeight-innerHeight)*arguments[0]));
+                ''', ratio)
+                time.sleep(0.15)
+                footers = [e for e in self.driver.find_elements(
+                    By.CSS_SELECTOR, '.data-footer-main') if e.is_displayed()]
+                if footers:
+                    break
         if len(footers) > 1:
             # 现场确认顶部/底部两个完全相同的结果栏；先核对所有副本条数一致。
             for footer in footers:
@@ -172,7 +199,7 @@ class OneDay:
             buttons = [e for e in footer.find_elements(By.CSS_SELECTOR, '.data-now-export.dataBtnCom')
                        if e.is_displayed() and e.is_enabled() and e.text.strip() == '立即导出']
             if len(buttons) != 1:
-                raise RuntimeError('底部正式导出按钮不唯一，尚未点击。')
+                raise RecoverablePageError('上下扫描后底部正式导出按钮不唯一，尚未点击。')
             self.visible_click(buttons[0], wait_seconds=30)
             return
         xpath = ".//*[normalize-space(text())='立即导出']"
@@ -213,7 +240,8 @@ class OneDay:
                       for e in choices]
         path = self.base / 'export_entry_diagnostic.json'
         path.write_text(json.dumps(diagnostic, ensure_ascii=False, indent=2), encoding='utf-8')
-        raise RuntimeError(f'导出入口仍有{len(choices)}个候选，尚未点击；控件结构已保存到{path}')
+        raise RecoverablePageError(
+            f'上下扫描后导出入口仍有{len(choices)}个候选，尚未点击；控件结构已保存到{path}')
 
     def release_finished_query_mask(self):
         """只处理查询结束后仍截获点击的退出动画遮罩。"""
@@ -317,7 +345,18 @@ class OneDay:
         resets = [e for e in self.driver.find_elements(By.XPATH, "//button[normalize-space(.)='重置']")
                   if e.is_displayed()]
         if len(resets) != 1:
-            raise RuntimeError('无法唯一定位筛选区的重置按钮，未提交查询。')
+            for ratio in (0, 0.5, 1):
+                self.driver.execute_script('''
+                    const root=document.scrollingElement || document.documentElement;
+                    window.scrollTo(0, Math.max(0, (root.scrollHeight-innerHeight)*arguments[0]));
+                ''', ratio)
+                time.sleep(0.15)
+                resets = [e for e in self.driver.find_elements(
+                    By.XPATH, "//button[normalize-space(.)='重置']") if e.is_displayed()]
+                if len(resets) == 1:
+                    break
+        if len(resets) != 1:
+            raise RecoverablePageError('上下扫描后仍无法唯一定位筛选区的重置按钮，未提交查询。')
         ancestor = resets[0]
         for _ in range(6):
             ancestor = ancestor.find_element(By.XPATH, '..')
@@ -326,12 +365,12 @@ class OneDay:
             if not confirms:
                 continue
             if len(confirms) != 1:
-                raise RuntimeError('与重置同组的确定按钮仍不唯一，未提交查询。')
+                raise RecoverablePageError('与重置同组的确定按钮仍不唯一，未提交查询。')
             if not confirms[0].is_enabled():
-                raise RuntimeError('筛选确定按钮不可用，未提交查询。')
+                raise RecoverablePageError('筛选确定按钮不可用，未提交查询。')
             self.visible_click(confirms[0])
             return
-        raise RuntimeError('未找到与重置同组的确定按钮，未提交查询。')
+        raise RecoverablePageError('未找到与重置同组的确定按钮，未提交查询。')
 
     def find_page(self, predicate, timeout=25, window_filter=None):
         """重新枚举窗口及 iframe，避免沿用已关闭窗口；不导航、不提交。"""
@@ -599,7 +638,7 @@ class OneDay:
                 if not retryable:
                     raise
                 if attempt == 2:
-                    raise RuntimeError('日期控件连续三次未能打开，已停止且未提交。') from error
+                    raise RecoverablePageError('日期控件连续三次未能打开，已停止且未提交。') from error
                 print(f'日期控件未就绪，刷新筛选页后重试（{attempt + 2}/3）', flush=True)
                 time.sleep(1)
 
@@ -663,7 +702,7 @@ class OneDay:
             return found.length===1?found[0]:null;
         ''')
         if row is None:
-            raise RuntimeError('未唯一找到信息类型筛选行；停止，避免导出其他公告类别')
+            raise RecoverablePageError('未唯一找到信息类型筛选行；页面可能尚未加载完整')
         return row
 
     def selected_notice_types(self, row):
@@ -685,7 +724,7 @@ class OneDay:
             return choices.length===1?choices[0]:null;
         ''', row, key)
         if option is None:
-            raise RuntimeError(f'信息类型“{key}”控件不唯一，停止')
+            raise RecoverablePageError(f'信息类型“{key}”控件不唯一；页面可能尚未加载完整')
         return option
 
     def select_notice_types(self):
@@ -781,7 +820,8 @@ class OneDay:
         try:
             self.find_page(expected_order, timeout=30, window_filter=new_order_window)
         except TimeoutException:
-            raise RuntimeError(f'未找到本次新开的{count}条订单页，未选择旧订单、未确认扣除。')
+            raise RecoverablePageError(
+                f'未找到本次新开的{count}条订单页，未选择旧订单、未确认扣除。')
         self._order_window = self.driver.current_window_handle
         self._order_created = self._order_window not in before
         self._order_frame_url = self.driver.execute_script('return location.href')
@@ -796,7 +836,7 @@ class OneDay:
         labels = [e for e in self.driver.find_elements(By.XPATH, "//label[.//input[@type='checkbox']]")
                   if e.is_displayed() and '已阅读并同意' in e.text and '服务条款' in e.text]
         if len(labels) != 1:
-            raise RuntimeError('协议复选框不唯一。')
+            raise RecoverablePageError('协议复选框不唯一；订单页可能尚未加载完整。')
         checkbox = labels[0].find_element(By.CSS_SELECTOR, 'input[type="checkbox"]')
         if not checkbox.is_selected():
             self.visible_click(labels[0].find_element(By.CSS_SELECTOR, '.el-checkbox__inner'))
