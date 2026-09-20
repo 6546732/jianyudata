@@ -8,6 +8,13 @@ from pathlib import Path
 from urllib.request import ProxyHandler, build_opener
 
 PERSISTENT_CHROME_TASK = 'Jianyu-Automation-Chrome'
+BACKGROUND_CHROME_ARGS = (
+    '--headless=new',
+    '--disable-notifications',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+)
 
 
 def flag(command, name):
@@ -114,6 +121,7 @@ def connect_browser(chrome, base, existing=None, preferred_profile=None, chromed
             process = subprocess.Popen([
                 str(chrome), '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1',
                 f'--user-data-dir={profile.resolve()}', '--no-first-run', '--no-default-browser-check',
+                *BACKGROUND_CHROME_ARGS,
                 'https://www.jianyu360.cn/'
             ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                creationflags=(getattr(subprocess, 'DETACHED_PROCESS', 0)
