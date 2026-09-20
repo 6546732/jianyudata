@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,109 @@ from prepare_import import prepare
 NODE = Path(os.environ.get("SFOA_NODE", "D:/install/SOFTWARE DOWNLOAD/sf/client/bin/node.exe"))
 SF_CLI = Path(os.environ.get("SFOA_CLI", "D:/install/SOFTWARE DOWNLOAD/sf/client/bin/run.js"))
 DEFAULT_BASE = Path(r"D:\桌面\data")
+BULK_API_VERSION = os.environ.get("SFOA_API_VERSION", "67.0")
+
+
+def _sf_environment() -> dict:
+    environment = os.environ.copy()
+    environment["SHELL"] = "powershell"
+    return environment
+
+
+def sf_rest(target_org: str, endpoint: str, timeout: int = 180) -> dict:
+    """Call Salesforce REST through the authenticated CLI and return its body."""
+    process = subprocess.run(
+        [str(NODE), str(SF_CLI), "api", "request", "rest", endpoint,
+         "--target-org", target_org, "--json"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=timeout, env=_sf_environment(),
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if not process.stdout.strip():
+        raise RuntimeError(
+            "Salesforce REST 查询没有返回内容："
+            f"exit={process.returncode} stderr_chars={len(process.stderr)}")
+    try:
+        payload = json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Salesforce REST 查询返回的不是 JSON") from error
+    if process.returncode or payload.get("status") != 0:
+        raise RuntimeError(
+            "Salesforce REST 查询失败："
+            f"exit={process.returncode} status={payload.get('status')}")
+    result = payload.get("result") or {}
+    body = result.get("body", result)
+    if isinstance(body, str):
+        body = json.loads(body)
+    if not isinstance(body, dict):
+        raise RuntimeError("Salesforce REST 查询缺少响应正文")
+    return body
+
+
+def _salesforce_time(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%f%z").astimezone(timezone.utc)
+
+
+def validate_bulk_job(job: dict, expected_rows: int) -> dict:
+    """Require an exact, successful bidnews upsert before advancing the manifest."""
+    processed = int(job.get("numberRecordsProcessed", -1))
+    failed = int(job.get("numberRecordsFailed", -1))
+    valid = (
+        job.get("object") == "bidnews__c"
+        and job.get("operation") == "upsert"
+        and job.get("externalIdFieldName") == "Source_Key__c"
+        and job.get("state") == "JobComplete"
+        and processed == expected_rows
+        and failed == 0
+    )
+    if not valid:
+        raise RuntimeError(
+            "Salesforce Bulk Job 未通过核验："
+            f"job={job.get('id')} object={job.get('object')} "
+            f"operation={job.get('operation')} state={job.get('state')} "
+            f"processed={processed}/{expected_rows} failed={failed}")
+    return job
+
+
+def get_bulk_job(target_org: str, job_id: str) -> dict:
+    endpoint = f"/services/data/v{BULK_API_VERSION}/jobs/ingest/{job_id}"
+    return sf_rest(target_org, endpoint)
+
+
+def find_recent_bulk_job(target_org: str, started_at: datetime,
+                         expected_rows: int, attempts: int = 6) -> dict:
+    """Find the job created by this run when the upsert command loses stdout."""
+    endpoint = f"/services/data/v{BULK_API_VERSION}/jobs/ingest"
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            records = sf_rest(target_org, endpoint).get("records") or []
+            candidates = []
+            for job in records:
+                try:
+                    created_at = _salesforce_time(job.get("createdDate", ""))
+                except (TypeError, ValueError):
+                    continue
+                if (created_at >= started_at
+                        and job.get("object") == "bidnews__c"
+                        and job.get("operation") == "upsert"
+                        and job.get("externalIdFieldName") == "Source_Key__c"):
+                    candidates.append((created_at, job))
+            for _, summary in sorted(candidates, reverse=True,
+                                     key=lambda item: item[0]):
+                detail = get_bulk_job(target_org, summary["id"])
+                if detail.get("state") in {"Open", "UploadComplete", "InProgress"}:
+                    continue
+                if int(detail.get("numberRecordsProcessed", -1)) == expected_rows:
+                    return validate_bulk_job(detail, expected_rows)
+        except (RuntimeError, subprocess.SubprocessError) as error:
+            last_error = error
+        if attempt + 1 < attempts:
+            time.sleep(5)
+    message = "找不到与本次上传时间、对象、唯一键及条数完全匹配的 Bulk Job"
+    if last_error:
+        message += f"；最后一次查询错误：{last_error}"
+    raise RuntimeError(message)
 
 
 def verify_recent_upsert(csv_path: Path, target_org: str, started_at: datetime,
@@ -33,8 +137,6 @@ def verify_recent_upsert(csv_path: Path, target_org: str, started_at: datetime,
             or not all(re.fullmatch(r"[0-9a-f]{64}", key) for key in keys)):
         return False
     since = started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-    environment = os.environ.copy()
-    environment["SHELL"] = "powershell"
     for offset in range(0, len(keys), 100):
         batch = keys[offset:offset + 100]
         quoted = ",".join(f"'{key}'" for key in batch)
@@ -43,7 +145,7 @@ def verify_recent_upsert(csv_path: Path, target_org: str, started_at: datetime,
         query = subprocess.run(
             [str(NODE), str(SF_CLI), "data", "query", "--target-org", target_org,
              "--query", soql, "--json"], capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=180, env=environment,
+            encoding="utf-8", errors="replace", timeout=180, env=_sf_environment(),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         try:
@@ -62,6 +164,27 @@ def digest(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             hash_object.update(chunk)
     return hash_object.hexdigest()
+
+
+def _write_manifest(path: Path, manifest: dict) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                         encoding="utf-8")
+    temporary.replace(path)
+
+
+def _pending_files(base: Path, force: bool = False) -> tuple[Path, Path, dict, list[Path], dict]:
+    source = base / "downloads"
+    output = base / "sfoa_upload"
+    output.mkdir(parents=True, exist_ok=True)
+    manifest_path = base / "sfoa_sync_manifest.json"
+    manifest = (json.loads(manifest_path.read_text(encoding="utf-8"))
+                if manifest_path.exists() else {"version": 1, "files": {}})
+    files = sorted(p for p in source.rglob("*.xlsx") if not p.name.startswith("~$"))
+    hashes = {str(p.resolve()): digest(p) for p in files}
+    pending = [p for p in files if force or
+               manifest["files"].get(str(p.resolve())) != hashes[str(p.resolve())]]
+    return output, manifest_path, manifest, pending, hashes
 
 
 @contextmanager
@@ -96,19 +219,11 @@ def single_instance(path: Path):
 
 def sync(base: Path = DEFAULT_BASE, target_org: str = "zihao", force: bool = False) -> dict:
     base = base.resolve()
-    source = base / "downloads"
-    output = base / "sfoa_upload"
-    output.mkdir(parents=True, exist_ok=True)
-    manifest_path = base / "sfoa_sync_manifest.json"
     with single_instance(base / "sfoa_sync.lock"):
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {"version": 1, "files": {}}
-        files = sorted(p for p in source.rglob("*.xlsx") if not p.name.startswith("~$"))
-        hashes = {str(p.resolve()): digest(p) for p in files}
-        pending = [p for p in files if force or
-                   manifest["files"].get(str(p.resolve())) != hashes[str(p.resolve())]]
+        output, manifest_path, manifest, pending, hashes = _pending_files(base, force)
         if not pending:
             return {"status": "unchanged", "files": 0, "rows": 0}
-        report = prepare(source, output, selected_files=pending)
+        report = prepare(base / "downloads", output, selected_files=pending)
         if report["warnings"]:
             raise RuntimeError("导入预检查存在异常，未上传：" + json.dumps(report["warnings"], ensure_ascii=False))
         if report["rows_written"]:
@@ -120,25 +235,30 @@ def sync(base: Path = DEFAULT_BASE, target_org: str = "zihao", force: bool = Fal
                 "--file", str((output / "bidnews_upsert.csv").resolve()),
                 "--line-ending", "CRLF", "--wait", "10", "--json",
             ]
-            environment = os.environ.copy()
-            environment["SHELL"] = "powershell"
             started_at = datetime.now(timezone.utc)
             process = subprocess.run(
                 command, capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=900, env=environment,
+                errors="replace", timeout=900, env=_sf_environment(),
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             verified_without_cli_result = False
             try:
                 result = json.loads(process.stdout)
             except json.JSONDecodeError as error:
-                if not verify_recent_upsert(output / "bidnews_upsert.csv", target_org,
-                                            started_at, report["rows_written"]):
-                    raise RuntimeError(
-                        "Salesforce CLI 未返回 JSON，且无法核实本次所有外部键均已更新；"
-                        f"exit={process.returncode} stderr_chars={len(process.stderr)}；"
-                        "未推进同步进度") from error
-                job_id = None
+                try:
+                    job = find_recent_bulk_job(target_org, started_at,
+                                               report["rows_written"])
+                    job_id = job["id"]
+                    reconciliation_method = "bulk_job_rest_lookup"
+                except RuntimeError as lookup_error:
+                    if not verify_recent_upsert(output / "bidnews_upsert.csv", target_org,
+                                                started_at, report["rows_written"]):
+                        raise RuntimeError(
+                            "Salesforce CLI 未返回 JSON，且 REST Job 与外部键核验均失败；"
+                            f"exit={process.returncode} stderr_chars={len(process.stderr)}；"
+                            f"REST={lookup_error}；未推进同步进度") from error
+                    job_id = None
+                    reconciliation_method = "all_external_ids_modified_after_bulk_submit"
                 verified_without_cli_result = True
             else:
                 job = (result.get("result") or {}).get("jobInfo") or {}
@@ -162,17 +282,44 @@ def sync(base: Path = DEFAULT_BASE, target_org: str = "zihao", force: bool = Fal
         manifest["last_synced_at"] = datetime.now(timezone.utc).isoformat()
         if verified_without_cli_result:
             manifest["last_reconciliation"] = {
-                "method": "all_external_ids_modified_after_bulk_submit",
+                "method": reconciliation_method,
                 "files": len(pending), "rows": report["rows_written"],
                 "verified_at": manifest["last_synced_at"],
             }
-        temporary = manifest_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(manifest_path)
+        _write_manifest(manifest_path, manifest)
         return {"status": "uploaded", "files": len(pending),
                 "rows": report["rows_written"], "job_id": job_id,
                 "verified_without_cli_result": verified_without_cli_result,
                 "duplicates_in_batch": report["duplicates_skipped"]}
+
+
+def reconcile(base: Path, target_org: str, job_id: str) -> dict:
+    """Advance a stale manifest after independently proving a completed Bulk Job."""
+    base = base.resolve()
+    with single_instance(base / "sfoa_sync.lock"):
+        output, manifest_path, manifest, pending, hashes = _pending_files(base)
+        if not pending:
+            return {"status": "unchanged", "files": 0, "rows": 0,
+                    "job_id": manifest.get("last_job_id")}
+        report = prepare(base / "downloads", output, selected_files=pending)
+        if report["warnings"]:
+            raise RuntimeError("恢复预检查存在异常：" +
+                               json.dumps(report["warnings"], ensure_ascii=False))
+        job = validate_bulk_job(get_bulk_job(target_org, job_id), report["rows_written"])
+        for path in pending:
+            manifest["files"][str(path.resolve())] = hashes[str(path.resolve())]
+        now = datetime.now(timezone.utc).isoformat()
+        manifest["last_job_id"] = job["id"]
+        manifest["last_synced_at"] = now
+        manifest["last_reconciliation"] = {
+            "method": "explicit_bulk_job_rest_lookup",
+            "files": len(pending), "rows": report["rows_written"],
+            "verified_at": now,
+        }
+        _write_manifest(manifest_path, manifest)
+        return {"status": "reconciled", "files": len(pending),
+                "rows": report["rows_written"], "job_id": job["id"],
+                "failed": int(job["numberRecordsFailed"])}
 
 
 if __name__ == "__main__":
@@ -180,5 +327,8 @@ if __name__ == "__main__":
     parser.add_argument("--base", type=Path, default=DEFAULT_BASE)
     parser.add_argument("--target-org", default="zihao")
     parser.add_argument("--force", action="store_true", help="安全地按唯一键重传全部文件以补字段")
+    parser.add_argument("--reconcile-job", help="核验已完成的 Bulk Job 并恢复未推进的本地同步清单")
     args = parser.parse_args()
-    print(json.dumps(sync(args.base, args.target_org, args.force), ensure_ascii=False, indent=2))
+    action = (reconcile(args.base, args.target_org, args.reconcile_job)
+              if args.reconcile_job else sync(args.base, args.target_org, args.force))
+    print(json.dumps(action, ensure_ascii=False, indent=2))
