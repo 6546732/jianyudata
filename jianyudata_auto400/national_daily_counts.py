@@ -122,7 +122,7 @@ def collect(start, end, checkpoint, output, query):
 
 def scheduled_export_running():
     command = (
-        "(Get-ScheduledTask -TaskName 'Jianyu-Notebook-2100' "
+        "(Get-ScheduledTask -TaskName 'Jianyu-Formal-1030' "
         "-ErrorAction Stop).State.ToString()"
     )
     result = subprocess.run(
