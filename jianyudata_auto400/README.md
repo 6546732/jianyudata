@@ -9,6 +9,9 @@
 ## 入口
 
 - `run_scheduled_notebook.py`：Windows计划任务入口，启动Jupyter内核执行 `NIGHTLY_2100.ipynb`，每次只运行一轮。
+- 下载和 Salesforce 上传是两个独立任务。下载任务每天10:30运行，只保存并核验 Excel；上传任务每天11:00运行，只扫描本地未同步文件并通过 CLI 上传。两者分别发送简短汇总邮件，完整日志只保存在本机，不作为邮件附件发送。
+- `run_salesforce_sync.py`：独立 Salesforce 上传入口；失败时不推进同步清单，下次按唯一外部键安全重试。
+- `install_salesforce_upload_task.ps1`：继承正式任务的 Python 和登录用户，新建或更新每天11:00的 `Jianyu-Salesforce-Sync-1100`。
 - `nightly_job.py`：优先加载本目录独立模块，缺失时回退到 `START_AUTO.ipynb` 内嵌程序，连接和页面恢复最多尝试10次。登录失效时使用本机加密凭据尝试密码登录；需验证码时停止并提醒。
 - `START_AUTO.ipynb`：原交互Notebook，已清除输出。其手动调度时间及400条配置是旧入口，不用于每晚800条任务。
 - `setup_mail.ps1`：在本机输入Google应用专用密码，以当前Windows用户加密保存；不会发送测试邮件。

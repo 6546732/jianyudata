@@ -29,37 +29,50 @@ BULK_API_VERSION = os.environ.get("SFOA_API_VERSION", "67.0")
 def _sf_environment() -> dict:
     environment = os.environ.copy()
     environment["SHELL"] = "powershell"
+    # CLI 默认让所有进程写同一个每日 .sf 日志，并写本机遥测 ID。定时任务、
+    # 手工查询或其他 Salesforce 自动化并发时会触发 Windows EPERM，导致命令
+    # 在输出 JSON 前崩溃。自动任务不需要这两个文件。
+    environment["SF_DISABLE_LOG_FILE"] = "true"
+    environment["SF_DISABLE_TELEMETRY"] = "true"
     return environment
 
 
-def sf_rest(target_org: str, endpoint: str, timeout: int = 180) -> dict:
+def sf_rest(target_org: str, endpoint: str, timeout: int = 180,
+            attempts: int = 3) -> dict:
     """Call Salesforce REST through the authenticated CLI and return its body."""
-    process = subprocess.run(
-        [str(NODE), str(SF_CLI), "api", "request", "rest", endpoint,
-         "--target-org", target_org, "--json"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=timeout, env=_sf_environment(),
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    if not process.stdout.strip():
-        raise RuntimeError(
-            "Salesforce REST 查询没有返回内容："
-            f"exit={process.returncode} stderr_chars={len(process.stderr)}")
-    try:
-        payload = json.loads(process.stdout)
-    except json.JSONDecodeError as error:
-        raise RuntimeError("Salesforce REST 查询返回的不是 JSON") from error
-    if process.returncode or payload.get("status") != 0:
-        raise RuntimeError(
-            "Salesforce REST 查询失败："
-            f"exit={process.returncode} status={payload.get('status')}")
-    result = payload.get("result") or {}
-    body = result.get("body", result)
-    if isinstance(body, str):
-        body = json.loads(body)
-    if not isinstance(body, dict):
-        raise RuntimeError("Salesforce REST 查询缺少响应正文")
-    return body
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        process = subprocess.run(
+            [str(NODE), str(SF_CLI), "api", "request", "rest", endpoint,
+             "--target-org", target_org, "--json"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, env=_sf_environment(),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            if not process.stdout.strip():
+                raise RuntimeError(
+                    "Salesforce REST 查询没有返回内容："
+                    f"exit={process.returncode} stderr_chars={len(process.stderr)}")
+            payload = json.loads(process.stdout)
+            if process.returncode or payload.get("status") != 0:
+                raise RuntimeError(
+                    "Salesforce REST 查询失败："
+                    f"exit={process.returncode} status={payload.get('status')} "
+                    f"message={str(payload.get('message') or payload.get('name') or '')[:200]}")
+            result = payload.get("result") or {}
+            body = result.get("body", result)
+            if isinstance(body, str):
+                body = json.loads(body)
+            if not isinstance(body, dict):
+                raise RuntimeError("Salesforce REST 查询缺少响应正文")
+            return body
+        except (json.JSONDecodeError, RuntimeError) as error:
+            last_error = error
+            if attempt < attempts:
+                time.sleep(5 * attempt)
+    raise RuntimeError(
+        f"Salesforce REST 查询连续{attempts}次失败：{last_error}") from last_error
 
 
 def _salesforce_time(value: str) -> datetime:
@@ -173,11 +186,25 @@ def _write_manifest(path: Path, manifest: dict) -> None:
     temporary.replace(path)
 
 
-def _pending_files(base: Path, force: bool = False) -> tuple[Path, Path, dict, list[Path], dict]:
+def _state_paths(base: Path, target_org: str) -> tuple[Path, Path, Path]:
+    """Keep upload output, manifest and lock isolated for each Salesforce org."""
+    if target_org == "zihao":
+        # Preserve the existing sandbox state and scheduled-task paths.
+        return (base / "sfoa_upload", base / "sfoa_sync_manifest.json",
+                base / "sfoa_sync.lock")
+    org_key = re.sub(r"[^A-Za-z0-9._-]+", "_", target_org).strip("._-")
+    if not org_key:
+        raise ValueError("Salesforce 组织别名不能为空")
+    return (base / f"sfoa_upload_{org_key}",
+            base / f"sfoa_sync_manifest_{org_key}.json",
+            base / f"sfoa_sync_{org_key}.lock")
+
+
+def _pending_files(base: Path, force: bool = False,
+                   target_org: str = "zihao") -> tuple[Path, Path, dict, list[Path], dict]:
     source = base / "downloads"
-    output = base / "sfoa_upload"
+    output, manifest_path, _ = _state_paths(base, target_org)
     output.mkdir(parents=True, exist_ok=True)
-    manifest_path = base / "sfoa_sync_manifest.json"
     manifest = (json.loads(manifest_path.read_text(encoding="utf-8"))
                 if manifest_path.exists() else {"version": 1, "files": {}})
     files = sorted(p for p in source.rglob("*.xlsx") if not p.name.startswith("~$"))
@@ -219,14 +246,18 @@ def single_instance(path: Path):
 
 def sync(base: Path = DEFAULT_BASE, target_org: str = "zihao", force: bool = False) -> dict:
     base = base.resolve()
-    with single_instance(base / "sfoa_sync.lock"):
-        output, manifest_path, manifest, pending, hashes = _pending_files(base, force)
+    _, _, lock_path = _state_paths(base, target_org)
+    with single_instance(lock_path):
+        output, manifest_path, manifest, pending, hashes = _pending_files(
+            base, force, target_org)
         if not pending:
             return {"status": "unchanged", "files": 0, "rows": 0}
         report = prepare(base / "downloads", output, selected_files=pending)
         if report["warnings"]:
             raise RuntimeError("导入预检查存在异常，未上传：" + json.dumps(report["warnings"], ensure_ascii=False))
         if report["rows_written"]:
+            # 在创建写入型 Bulk Job 前确认认证和网络可用；预检只读且可安全重试。
+            sf_rest(target_org, f"/services/data/v{BULK_API_VERSION}/limits")
             command = [
                 str(NODE), str(SF_CLI), "data", "upsert", "bulk",
                 "--target-org", target_org,
@@ -296,8 +327,10 @@ def sync(base: Path = DEFAULT_BASE, target_org: str = "zihao", force: bool = Fal
 def reconcile(base: Path, target_org: str, job_id: str) -> dict:
     """Advance a stale manifest after independently proving a completed Bulk Job."""
     base = base.resolve()
-    with single_instance(base / "sfoa_sync.lock"):
-        output, manifest_path, manifest, pending, hashes = _pending_files(base)
+    _, _, lock_path = _state_paths(base, target_org)
+    with single_instance(lock_path):
+        output, manifest_path, manifest, pending, hashes = _pending_files(
+            base, target_org=target_org)
         if not pending:
             return {"status": "unchanged", "files": 0, "rows": 0,
                     "job_id": manifest.get("last_job_id")}
