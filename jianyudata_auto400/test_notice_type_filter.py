@@ -5,7 +5,9 @@ from pathlib import Path
 
 from selenium.webdriver.common.by import By
 
-from export_one_day import NOTICE_TYPES, NOTICE_TYPE_KEYS, OneDay, RecoverablePageError
+from export_one_day import (
+    NOTICE_TYPES, NOTICE_TYPE_KEYS, OneDay, RecoverablePageError, query_count,
+)
 
 
 class FilterJob(OneDay):
@@ -170,6 +172,13 @@ class NoticeTypeFilterTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '类型未确认'):
             job.query_filters(lambda _: job.events.append('regions'))
         self.assertEqual(job.events, ['dates', 'types'])
+
+    def test_query_count_accepts_difference_up_to_twenty(self):
+        self.assertEqual(query_count('为您筛选到 181 条数据 为您筛选到 201 条数据'), 201)
+
+    def test_query_count_rejects_difference_over_twenty(self):
+        with self.assertRaisesRegex(RecoverablePageError, '超过允许的20条'):
+            query_count('为您筛选到 180 条数据 为您筛选到 201 条数据')
 
     def test_transient_missing_date_pair_refreshes_and_retries(self):
         job = DateRetryJob()

@@ -3,6 +3,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from uuid import uuid4
 from export_range import ExportRange, province_key
+from export_one_day import QUERY_COUNT_TOLERANCE, RecoverablePageError
 
 
 class FastRange(ExportRange):
@@ -151,17 +152,29 @@ class FastRange(ExportRange):
                 return self.stop('waiting_quota' if remaining < self.daily_limit else 'needs_finer_split')
             regions = [i['region'] for i in selected if i['region'] is not None]
             fresh = self.count(regions)
-            if fresh != count:
+            difference = abs(fresh - count)
+            if difference > QUERY_COUNT_TOLERANCE:
                 self.save()
-                raise RuntimeError('组合实际条数发生变化，未提交；请核对缓存后重新规划')
+                raise RecoverablePageError(
+                    f'组合实际条数相差{difference}条，超过允许的{QUERY_COUNT_TOLERANCE}条，未提交')
+            if fresh != count:
+                print(f'组合复查由{count}条变为{fresh}条，相差{difference}条；采用复查值。', flush=True)
+                count = fresh
+            if count > min(remaining, self.daily_limit):
+                raise RecoverablePageError('容差复查后的实际条数超过本次可用额度，未提交')
             balance, actual = self.backend.prepare(self.state['current_date'], regions, count)
             check = self.backend.last_order_check
             if not isinstance(check, dict):
                 raise RuntimeError('缺少最终订单额度记录，禁止提交')
             self.state.setdefault('order_checks', []).append(check)
             self.save()
-            if type(balance) is not int or not 0 <= balance <= 800 or actual != count:
+            difference = abs(actual - count)
+            if (type(balance) is not int or not 0 <= balance <= 800
+                    or difference > QUERY_COUNT_TOLERANCE):
                 raise RuntimeError('结算条数或余额不合法')
+            if actual != count:
+                print(f'最终订单由{count}条变为{actual}条，相差{difference}条；采用订单实际值。', flush=True)
+                count = actual
             if self.today().isoformat() != run_day:
                 return self.stop('day_changed')
             # 网站最后显示更小的余额时，缩小本地预算并重新选择，绝不直接扣除。

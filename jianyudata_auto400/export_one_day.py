@@ -29,7 +29,8 @@ NOTICE_TYPES = ('招标', '邀标', '询价', '竞谈', '单一', '竞价', '变
                 '中标', '成交')
 # 网站支持直接选择“招标公告”整组；其余只取招标结果中的中标、成交。
 NOTICE_TYPE_KEYS = ('招标公告', '招标结果_中标', '招标结果_成交')
-VERSION = '2026-09-18-selected-notice-types-v3'
+QUERY_COUNT_TOLERANCE = 20
+VERSION = '2026-10-09-query-count-tolerance-v1'
 
 
 class BlockedControlError(RuntimeError):
@@ -41,6 +42,20 @@ class BlockedControlError(RuntimeError):
 
 class RecoverablePageError(RuntimeError):
     """页面、窗口或控件暂时不完整；未进入不允许重试的扣额阶段。"""
+
+
+def query_count(text):
+    """读取筛选页条数；容忍顶部和底部组件短暂刷新不同步。"""
+    values = list(map(int, re.findall(r'为您筛选到\s*(\d+)\s*条数据', text)))
+    if not values:
+        raise RecoverablePageError('查询条数缺失，页面可能尚未加载完整。')
+    low, high = min(values), max(values)
+    if high - low > QUERY_COUNT_TOLERANCE:
+        raise RecoverablePageError(
+            f'查询条数差异{high-low}条，超过允许的{QUERY_COUNT_TOLERANCE}条：{values}')
+    if low != high:
+        print(f'查询条数存在{high-low}条刷新误差：{values}；按较大值{high}条规划。', flush=True)
+    return high
 
 
 def calendar_month(text):
@@ -783,10 +798,7 @@ class OneDay:
             self.close_no_data()
             self.save(count=0, notice_types=list(NOTICE_TYPES), status='filtered')
             return 0
-        found = set(map(int, re.findall(r'为您筛选到\s*(\d+)\s*条数据', self.body())))
-        if len(found) != 1:
-            raise RuntimeError('查询条数不一致，停止。')
-        count = found.pop()
+        count = query_count(self.body())
         self.save(count=count, notice_types=list(NOTICE_TYPES), status='filtered')
         return count
 
@@ -815,9 +827,10 @@ class OneDay:
         def expected_order():
             text = self.body()
             url = self.driver.execute_script('return location.href')
-            counts = re.findall(r'已选择\s*(\d+)\s*条数据', text)
+            counts = {int(value) for value in re.findall(r'已选择\s*(\d+)\s*条数据', text)}
             return ('/front/dataExport/toCreateOrderPage/' in url
-                    and '选择支付方式' in text and counts == [str(count)])
+                    and '选择支付方式' in text and len(counts) == 1
+                    and abs(next(iter(counts)) - count) <= QUERY_COUNT_TOLERANCE)
 
         try:
             self.find_page(expected_order, timeout=30, window_filter=new_order_window)
@@ -827,7 +840,19 @@ class OneDay:
         self._order_window = self.driver.current_window_handle
         self._order_created = self._order_window not in before
         self._order_frame_url = self.driver.execute_script('return location.href')
-        print(f'已锁定本次订单页：{count}条', flush=True)
+        order_values = {int(value) for value in re.findall(
+            r'已选择\s*(\d+)\s*条数据', self.body())}
+        if len(order_values) != 1:
+            raise RecoverablePageError('订单页所选条数缺失或互相矛盾，未确认扣除。')
+        actual = order_values.pop()
+        difference = abs(actual - count)
+        if difference > QUERY_COUNT_TOLERANCE:
+            raise RecoverablePageError(
+                f'订单页与查询页相差{difference}条，超过允许的{QUERY_COUNT_TOLERANCE}条，未确认扣除。')
+        if actual != count:
+            print(f'订单页实际{actual}条，与查询规划{count}条相差{difference}条；以订单页为准。', flush=True)
+            self.save(count=actual)
+        print(f'已锁定本次订单页：{actual}条', flush=True)
         # 余额探测只读取订单页数字。即使全国条数高于余额并弹出“余额不足”，
         # 也不寻找协议、不确认扣除；调用方读取余额后关闭本次临时订单页。
         if not prepare_payment:
