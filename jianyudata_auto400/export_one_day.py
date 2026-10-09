@@ -184,8 +184,94 @@ class OneDay:
         element = self.unique(By.XPATH, f"//*[normalize-space(text())='{text}']")
         self.visible_click(element)
 
+    def visible_loading_masks(self):
+        return [element for element in self.driver.find_elements(
+            By.CSS_SELECTOR, '.loading_, .el-loading-mask') if element.is_displayed()]
+
+    def scroll_to_stable_bottom(self, timeout=6, stable_samples=3):
+        """Keep scrolling until lazy layout has stopped increasing the document height."""
+        deadline = time.monotonic() + timeout
+        previous = None
+        stable = 0
+        metrics = None
+        while time.monotonic() < deadline:
+            self.driver.execute_script('''
+                const root=document.scrollingElement || document.documentElement;
+                window.scrollTo(0, root.scrollHeight);
+            ''')
+            time.sleep(0.25)
+            metrics = self.driver.execute_script('''
+                const root=document.scrollingElement || document.documentElement;
+                return {
+                    top: window.scrollY,
+                    viewport: innerHeight,
+                    height: root.scrollHeight,
+                    remaining: root.scrollHeight-innerHeight-window.scrollY
+                };
+            ''')
+            signature = (round(metrics['height']), round(metrics['viewport']))
+            at_bottom = metrics['remaining'] <= 2
+            stable = stable + 1 if at_bottom and signature == previous else (1 if at_bottom else 0)
+            previous = signature
+            if stable >= stable_samples:
+                return metrics
+        raise RecoverablePageError(
+            f'页面高度在{timeout}秒内未稳定到最底部；最后状态：{metrics}')
+
+    def export_through_visible_bottom_bar(self):
+        """When a page mask remains, use only the uncovered fixed bottom export control."""
+        masks = self.visible_loading_masks()
+        if not masks:
+            return False
+        query = self.driver.execute_script('return window.__autoQuery || null')
+        if query and query.get('pending'):
+            print(f'检测到内部加载遮罩，筛选请求仍在进行（pending={query["pending"]}），暂不点击。',
+                  flush=True)
+            return False
+        metrics = self.scroll_to_stable_bottom()
+        footers = [element for element in self.driver.find_elements(
+            By.CSS_SELECTOR, '.data-footer-main') if element.is_displayed()]
+        if not footers:
+            print('检测到内部加载遮罩，但稳定滚到底部后未显示正式导出栏。', flush=True)
+            return False
+        footer = footers[-1]
+        counts = [element for element in footer.find_elements(
+            By.CSS_SELECTOR, '.dataExNum') if element.is_displayed()]
+        expected = str(self.state.get('count'))
+        if len(counts) != 1 or counts[0].text.strip() != expected:
+            print(f'底部导出栏条数未通过核对（预期{expected}），不点击。', flush=True)
+            return False
+        buttons = [element for element in footer.find_elements(
+            By.CSS_SELECTOR, '.data-now-export.dataBtnCom')
+            if element.is_displayed() and element.is_enabled()
+            and element.text.strip() == '立即导出']
+        if len(buttons) != 1:
+            print(f'底部正式导出按钮有{len(buttons)}个可用候选，不点击。', flush=True)
+            return False
+        button = buttons[0]
+        uncovered = self.driver.execute_script('''
+            const e=arguments[0], r=e.getBoundingClientRect();
+            const x=(Math.max(0,r.left)+Math.min(innerWidth,r.right))/2;
+            const y=(Math.max(0,r.top)+Math.min(innerHeight,r.bottom))/2;
+            const hit=document.elementFromPoint(x,y);
+            return !!hit && (hit===e || e.contains(hit));
+        ''', button)
+        if not uncovered:
+            print('底部“立即导出”仍被遮挡，不点击并进入恢复流程。', flush=True)
+            return False
+        try:
+            button.click()
+        except ElementClickInterceptedException:
+            print('底部“立即导出”在点击瞬间再次被遮挡，进入恢复流程。', flush=True)
+            return False
+        print('检测到内部加载遮罩；页面高度稳定后已通过底部正式“立即导出”继续。'
+              f'（scrollY={metrics["top"]}，height={metrics["height"]}）', flush=True)
+        return True
+
     def export_entry(self):
         """区分固定结果栏与页面内副本，并合并同一按钮的内部文字。"""
+        if self.export_through_visible_bottom_bar():
+            return
         self.release_finished_query_mask()
         query = self.driver.execute_script('return window.__autoQuery || null')
         if query and query.get('pending'):
