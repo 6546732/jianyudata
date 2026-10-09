@@ -168,6 +168,9 @@ def restart_browser(chrome, base, driver):
     if not endpoint(port):
         if occupied:
             raise RuntimeError('专用 Chrome 调试端口失效但配置目录仍被占用，拒绝强制关闭。')
+        service = getattr(driver, 'service', None)
+        if service is not None:
+            service.stop()
         print(f'自动化 Chrome 已退出，重新启动：{profile}', flush=True)
         return connect_browser(chrome, base, preferred_profile=profile)
     print(f'关闭自动化 Chrome 并重新启动：{profile}', flush=True)
@@ -183,9 +186,22 @@ def restart_browser(chrome, base, driver):
         time.sleep(0.5)
     if endpoint(port) or still_occupied():
         raise RuntimeError('自动化 Chrome 尚未释放专用配置目录，停止重试。')
+    service = getattr(driver, 'service', None)
+    if service is not None:
+        service.stop()
     # Chrome 释放用户数据目录后，使用原独立计划任务重新启动。
     time.sleep(2)
     return connect_browser(chrome, base, preferred_profile=profile)
+
+
+def refresh_current_page(driver, timeout=45):
+    """Refresh the current page without creating or closing a browser window."""
+    before = driver.current_url
+    driver.refresh()
+    from selenium.webdriver.support.ui import WebDriverWait
+    WebDriverWait(driver, timeout, poll_frequency=0.25).until(
+        lambda d: d.execute_script('return document.readyState') == 'complete')
+    return {'refreshed': True, 'url': before}
 
 
 def click_safe_blank(driver):

@@ -19,13 +19,17 @@ class Chip:
 
 
 class Driver:
-    def __init__(self, selected):
+    def __init__(self, selected, available=None):
         self.selected = set(selected)
+        self.available = set(available or [])
         self.clicks = 0
 
     def find_elements(self, by, locator):
         if by == By.CSS_SELECTOR and locator == '#area-del .delete-close':
             return [Chip(name) for name in self.selected]
+        if (by == By.CSS_SELECTOR and
+                locator == '#area-del + .select-area-box > span.select-area'):
+            return [Chip(name) for name in self.available | {'全国'}]
         return []
 
     def execute_script(self, script, *args):
@@ -42,8 +46,8 @@ class Driver:
 
 
 class Job:
-    def __init__(self, selected):
-        self.driver = Driver(selected)
+    def __init__(self, selected, available=None):
+        self.driver = Driver(selected, available)
 
     def unique(self, by, locator):
         import re
@@ -70,6 +74,13 @@ class NationalSelectionTest(unittest.TestCase):
         job = Job(set())
         self.ui.select_regions(job, [])
         self.assertEqual(getattr(job.driver, 'clicks', 0), 0)
+
+    def test_all_province_chips_are_already_national(self):
+        provinces = {'安徽', '北京', '浙江'}
+        job = Job(provinces, available=provinces)
+        self.ui.select_regions(job, [])
+        self.assertEqual(job.driver.clicks, 0)
+        self.assertEqual(job.driver.selected, provinces)
 
     def test_province_selection_switches_to_national_once(self):
         job = Job({'北京'})

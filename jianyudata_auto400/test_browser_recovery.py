@@ -8,6 +8,17 @@ import browser_session
 
 
 class BrowserRecoveryTests(unittest.TestCase):
+    def test_refreshes_current_page_without_closing_browser(self):
+        driver = Mock(current_url='https://www.jianyu360.cn/front/dataExport/toSieve')
+        driver.execute_script.return_value = 'complete'
+        result = browser_session.refresh_current_page(driver, timeout=1)
+        self.assertEqual(result, {
+            'refreshed': True,
+            'url': 'https://www.jianyu360.cn/front/dataExport/toSieve',
+        })
+        driver.refresh.assert_called_once_with()
+        driver.execute_cdp_cmd.assert_not_called()
+
     def test_refuses_to_close_unverified_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             driver = Mock(_jianyu_profile=str(Path(directory) / 'other'), _jianyu_port=9222)
@@ -27,6 +38,7 @@ class BrowserRecoveryTests(unittest.TestCase):
                   patch.object(browser_session.time, 'sleep')):
                 self.assertIs(browser_session.restart_browser('chrome.exe', directory, driver), replacement)
             driver.execute_cdp_cmd.assert_called_once_with('Browser.close', {})
+            driver.service.stop.assert_called_once_with()
             connect.assert_called_once_with('chrome.exe', directory, preferred_profile=profile)
 
     def test_starts_verified_profile_again_after_browser_has_exited(self):
@@ -40,6 +52,7 @@ class BrowserRecoveryTests(unittest.TestCase):
                   patch.object(browser_session, 'connect_browser', return_value=replacement) as connect):
                 self.assertIs(browser_session.restart_browser('chrome.exe', directory, driver), replacement)
             driver.execute_cdp_cmd.assert_not_called()
+            driver.service.stop.assert_called_once_with()
             connect.assert_called_once_with('chrome.exe', directory, preferred_profile=profile)
 
     def test_does_not_force_close_dead_port_with_occupied_profile(self):

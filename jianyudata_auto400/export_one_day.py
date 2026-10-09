@@ -187,6 +187,10 @@ class OneDay:
     def export_entry(self):
         """区分固定结果栏与页面内副本，并合并同一按钮的内部文字。"""
         self.release_finished_query_mask()
+        query = self.driver.execute_script('return window.__autoQuery || null')
+        if query and query.get('pending'):
+            raise RecoverablePageError(
+                f'筛选请求仍在处理中（pending={query["pending"]}，urls={query.get("urls", [])}），未点击导出。')
         # 已由现场诊断确认：底部栏含数量、修改条件和正式导出按钮。
         footers = [e for e in self.driver.find_elements(By.CSS_SELECTOR, '.data-footer-main')
                    if e.is_displayed()]
@@ -217,7 +221,7 @@ class OneDay:
                        if e.is_displayed() and e.is_enabled() and e.text.strip() == '立即导出']
             if len(buttons) != 1:
                 raise RecoverablePageError('上下扫描后底部正式导出按钮不唯一，尚未点击。')
-            self.visible_click(buttons[0], wait_seconds=30)
+            self.export_control_click(buttons[0])
             return
         xpath = ".//*[normalize-space(text())='立即导出']"
 
@@ -246,12 +250,12 @@ class OneDay:
                     for element in controls(scope):
                         choices[element.id] = element
             if len(choices) == 1:
-                self.visible_click(next(iter(choices.values())), wait_seconds=30)
+                self.export_control_click(next(iter(choices.values())))
                 return
 
         choices = controls(self.driver.find_element(By.TAG_NAME, 'body'))
         if len(choices) == 1:
-            self.visible_click(choices[0], wait_seconds=30)
+            self.export_control_click(choices[0])
             return
         diagnostic = [e.find_element(By.XPATH, '..').get_attribute('outerHTML')[:8000]
                       for e in choices]
@@ -260,8 +264,39 @@ class OneDay:
         raise RecoverablePageError(
             f'上下扫描后导出入口仍有{len(choices)}个候选，尚未点击；控件结构已保存到{path}')
 
+    def export_control_click(self, element):
+        """导出入口被遮挡时按等待、调整窗口、安全空白处的顺序恢复。"""
+        first_block = None
+        try:
+            print('等待导出入口解除遮挡，最长60秒。', flush=True)
+            self.visible_click(element, wait_seconds=60)
+            return
+        except BlockedControlError as first_error:
+            first_block = first_error
+            print(f'等待60秒后仍被遮挡：{first_error.cover}；尝试调整专用窗口。', flush=True)
+
+        resized_block = None
+        try:
+            before = self.driver.get_window_size()
+            self.driver.set_window_size(1920, 1080)
+            print(f'专用窗口由{before}调整为1920x1080，重新检查导出入口。', flush=True)
+            self.visible_click(element, wait_seconds=8)
+            return
+        except BlockedControlError as resized_error:
+            resized_block = resized_error
+            print(f'调整窗口后仍被遮挡：{resized_error.cover}；尝试点击安全空白处。', flush=True)
+
+        from browser_session import click_safe_blank
+        blank = click_safe_blank(self.driver)
+        print(f'安全空白处处理结果：{blank}', flush=True)
+        if blank.get('clicked'):
+            time.sleep(1)
+            self.visible_click(element, wait_seconds=12)
+            return
+        raise resized_block from first_block
+
     def release_finished_query_mask(self):
-        """只处理查询结束后仍截获点击的退出动画遮罩。"""
+        """只处理已被查询观察器确认安全的残留加载遮罩。"""
         if self.state.get('count') is None:
             return
         leaving = self.driver.execute_script('''
@@ -283,18 +318,19 @@ class OneDay:
         cleared = self.driver.execute_script('''
             const q=window.__autoQuery;
             if (!q || q.pending!==0 || q.done<1 || q.status!==200 ||
-                Date.now()-q.finished<3000) return 0;
+                !q.staleMaskSafe || Date.now()-q.finished<15000 ||
+                Number(q.stableCount)!==Number(arguments[0])) return 0;
             const count=String(arguments[0]);
             const result=[...document.querySelectorAll('.dataExNum')]
                 .filter(e=>e.getClientRects().length).map(e=>e.textContent.trim());
             if (!result.length || result.some(n=>n!==count)) return 0;
             let cleared=0;
             for(const mask of document.querySelectorAll('.el-loading-mask')) {
-                const classes=mask.classList;
-                if(classes.contains('el-loading-fade-leave') &&
-                   classes.contains('el-loading-fade-leave-active') &&
-                   getComputedStyle(mask).pointerEvents!=='none') {
+                const style=getComputedStyle(mask);
+                if(style.display!=='none' && style.visibility!=='hidden' &&
+                   style.pointerEvents!=='none') {
                     mask.style.pointerEvents='none';
+                    mask.style.display='none';
                     cleared++;
                 }
             }
@@ -321,11 +357,17 @@ class OneDay:
             """, element)
 
         # 少数固定栏较宽：通过正常滚动把控件放到不同高度。
-        for offset in (0, -180, 360):
+        offsets = (0, -180, 360)
+        deadline = time.monotonic() + wait_seconds
+        for index, offset in enumerate(offsets):
             if offset:
                 self.driver.execute_script('window.scrollBy(0, arguments[0]);', offset)
             try:
-                WebDriverWait(self.driver, wait_seconds, poll_frequency=0.2).until(uncovered)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutException()
+                slice_seconds = max(0.2, remaining / (len(offsets) - index))
+                WebDriverWait(self.driver, slice_seconds, poll_frequency=0.2).until(uncovered)
                 break
             except TimeoutException:
                 continue
@@ -817,8 +859,21 @@ class OneDay:
         before = set(self.driver.window_handles)
         self._order_source = source
         # 枚举窗口会丢失iframe上下文，恢复本次查询所在frame，不跳到旧页面。
+        # 结果会在数秒内有少量动态变化。定位包含任意当前结果条数的页面，
+        # 再按统一容差采用底部固定栏的最新值，避免201/202这类误差阻止导出。
         self.find_frame_here(lambda: bool(re.search(
-            rf'为您筛选到\s*{count}\s*条数据', self.body())))
+            r'为您筛选到\s*\d+\s*条数据', self.body())))
+        actual = query_count(self.body())
+        difference = abs(actual - count)
+        if difference > QUERY_COUNT_TOLERANCE:
+            raise RecoverablePageError(
+                f'导出前页面条数由{count}变为{actual}，相差{difference}条，超过允许的'
+                f'{QUERY_COUNT_TOLERANCE}条，尚未点击。')
+        if actual != count:
+            print(f'导出前页面条数由{count}变为{actual}，相差{difference}条；采用页面当前值。',
+                  flush=True)
+            self.save(count=actual)
+            count = actual
         self.export_entry()
 
         def new_order_window(handle):

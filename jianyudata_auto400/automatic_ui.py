@@ -48,6 +48,17 @@ class AutomaticUI:
             return {e.text.strip() for e in d.find_elements(By.CSS_SELECTOR, '#area-del .delete-close')
                     if e.is_displayed()}
 
+        def available():
+            return {e.text.strip() for e in d.find_elements(
+                By.CSS_SELECTOR, '#area-del + .select-area-box > span.select-area')
+                if e.is_displayed() and e.text.strip() != '全国'}
+
+        def is_national(values):
+            choices = available()
+            # 剑鱼有两种实际渲染：显示“全国”/无标签，或把全国展开成
+            # 全部34个省级标签。三种都表示全国，不能再次点击后反向切换。
+            return values in ({'全国'}, set()) or bool(choices and values == choices)
+
         def wait_for_loading():
             try:
                 WebDriverWait(d, 15, poll_frequency=0.2).until(lambda _: not any(
@@ -58,12 +69,12 @@ class AutomaticUI:
         current = selected()
         national = "//div[@id='area-del']/following-sibling::div[contains(@class,'select-area-box')][1]/span[normalize-space(.)='全国']"
         if not regions:
-            # “全国”可切换；已选中或没有地区标签时都不要重复点击。
-            if current and current != {'全国'}:
+            # “全国”可切换；网站也可能用全部省份标签表示全国。
+            if not is_national(current):
                 wait_for_loading()
                 self.region_click(job, job.unique(By.XPATH, national))
                 try:
-                    WebDriverWait(d, 20).until(lambda _: selected() in ({'全国'}, set()))
+                    WebDriverWait(d, 20).until(lambda _: is_national(selected()))
                 except TimeoutException:
                     # 仅在旧省份标签确实残留时清除它们；清空后不再次切换“全国”。
                     for _ in range(40):
@@ -81,7 +92,7 @@ class AutomaticUI:
                         WebDriverWait(d, 5).until(lambda _: name not in selected())
                     else:
                         raise RuntimeError('省份标签超过40个，拒绝继续清除')
-                    if selected() not in ({'全国'}, set()):
+                    if not is_national(selected()):
                         raise RuntimeError('未能恢复全国筛选，停止避免漏数')
             current = set()
         elif '全国' in current:
@@ -107,8 +118,8 @@ class AutomaticUI:
                 self.region_click(job, all_region[0])
                 self.region_click(job, job.unique(By.CSS_SELECTOR, "button[onclick='areaSelect(true)']"))
             WebDriverWait(d, 5).until(lambda _: name in selected() and '全国' not in selected())
-        WebDriverWait(d, 20).until(lambda _: selected() == (set(regions) if regions else {'全国'}) or
-                                  (not regions and selected() == set()))
+        WebDriverWait(d, 20).until(lambda _: selected() == set(regions) if regions
+                                  else is_national(selected()))
         self.arm_query(job)
 
     def arm_query(self, job):
@@ -122,6 +133,8 @@ class AutomaticUI:
             const target=new URL(String(url),location.href).pathname==='/front/dataExport/sieveData';
             const q=window.__autoQuery;
             if(target && q) {
+              q.started=Date.now();
+              q.urls.push(String(url));
               q.pending++;
               this.addEventListener('loadend',()=>{
                 if(window.__autoQuery===q) {q.pending--;q.done++;q.status=this.status;q.finished=Date.now();}
@@ -130,7 +143,8 @@ class AutomaticUI:
             return original.call(this,method,url,...rest);
           };
         }
-        window.__autoQuery={done:0,status:0,finished:0,pending:0};
+        window.__autoQuery={done:0,status:0,finished:0,pending:0,
+                            armed:Date.now(),started:0,urls:[]};
         if (window.__autoResultObserver) window.__autoResultObserver.disconnect();
         window.__autoResultMutation={count:0,last:0};
         const resultRoot=document.querySelector('#dataExport_main') || document.body;
@@ -148,11 +162,36 @@ class AutomaticUI:
             q=job.driver.execute_script('return window.__autoQuery')
             if q and q['done'] and q['status'] != 200:
                 raise RuntimeError('本次筛选请求失败，未读取旧结果。')
-            if q and q['done'] and q['pending']==0 and job.driver.execute_script('return Date.now()-window.__autoQuery.finished') > 500:
-                return True
+            if q and q['pending']:
+                return False
+            if q and q['done']:
+                # 网站偶尔在请求完成后永久保留 Element-UI 遮罩。先等15秒，
+                # 并要求结果区至少安静3秒、页面条数唯一，再把它标记为可安全
+                # 解除的残留遮罩。仍在请求或条数变化时绝不放行。
+                return bool(job.driver.execute_script('''
+                  const q=window.__autoQuery;
+                  if(!q || q.pending!==0 || !q.done || Date.now()-q.finished<3000) return false;
+                  const loading=[...document.querySelectorAll('.el-loading-mask,.loading_,.loading')]
+                    .some(e=>{const s=getComputedStyle(e);return s.display!=='none'&&
+                      s.visibility!=='hidden'&&e.offsetParent!==null;});
+                  if(!loading) return true;
+                  const m=window.__autoResultMutation;
+                  const values=[...(document.body.innerText||'').matchAll(
+                    /为您筛选到\\s*(\\d+)\\s*条数据/g)].map(x=>x[1]);
+                  const stableCount=values.length>0 && new Set(values).size===1;
+                  const quiet=!m || !m.last || Date.now()-m.last>=3000;
+                  if(Date.now()-q.finished>=15000 && stableCount && quiet) {
+                    q.staleMaskSafe=true;
+                    q.stableCount=Number(values[0]);
+                    return true;
+                  }
+                  return false;
+                '''))
             # 请求监听漏报时，必须确认结果区确实发生过变化、页面已稳定且
-            # 已出现新的结果数量或“无数据”提示，不能直接读取旧表格。
+            # 监听已布置至少5秒、结果确实更新且无加载层，才能使用后备信号。
             return bool(job.driver.execute_script('''
+              const q=window.__autoQuery;
+              if(!q || Date.now()-q.armed<5000 || q.started || q.pending || q.done) return false;
               const m=window.__autoResultMutation;
               if(!m || !m.count || Date.now()-m.last<800) return false;
               const loading=[...document.querySelectorAll('.el-loading-mask,.loading_,.loading')]

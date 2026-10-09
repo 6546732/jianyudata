@@ -127,6 +127,14 @@ class ExportRange:
                 raise ValueError('进度开始日期不一致')
             self.state.setdefault('skipped', [])
             self.state.setdefault('notifications', [])
+            if self.state.get('status') == 'submitting' and not self.state.get('pending'):
+                self.state.setdefault('state_repairs', []).append({
+                    'at': datetime.now().astimezone().isoformat(),
+                    'from': 'submitting', 'to': 'ready',
+                    'reason': 'no_pending_order',
+                })
+                self.state['status'] = 'ready'
+                self.save()
             return self._run()
         finally:
             release_run_lock(lock_handle, self.lock)

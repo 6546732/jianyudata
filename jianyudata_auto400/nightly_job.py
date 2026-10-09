@@ -159,9 +159,30 @@ def run():
                         if progress.get('pending'):
                             raise RuntimeError(
                                 '存在待恢复订单，禁止自动重启浏览器，以免重复扣额。') from after_blank
+            # 查询页等待和安全空白点击都未恢复时，先刷新当前页面并从进度
+            # 重新设置全部筛选条件。刷新不会创建订单；pending 一旦为真，上方
+            # 已经停止恢复，因此不会在扣额阶段重复提交。
+            try:
+                refreshed = sys.modules['browser_session'].refresh_current_page(driver)
+                record_recovery(error, attempt, 'page_refreshed', blank=refreshed)
+                login.ensure(driver)
+                time.sleep(2)
+                try:
+                    state = export_from_progress()
+                    break
+                except recoverable as after_refresh:
+                    progress = record_recovery(after_refresh, attempt, 'still_failed_after_refresh')
+                    if progress.get('pending'):
+                        raise RuntimeError(
+                            '刷新后发现待恢复订单，禁止重启浏览器，以免重复扣额。') from after_refresh
+            except Exception as refresh_error:
+                progress = record_recovery(refresh_error, attempt, 'page_refresh_failed')
+                if progress.get('pending'):
+                    raise RuntimeError(
+                        '刷新失败且存在待恢复订单，禁止重启浏览器。') from refresh_error
             if attempt == MAX_RECOVERY_ATTEMPTS:
                 raise RuntimeError(
-                    f'连续{MAX_RECOVERY_ATTEMPTS}轮上下查找、点击空白处或重启后仍失败，'
+                    f'连续{MAX_RECOVERY_ATTEMPTS}轮上下查找、等待、点击空白处、刷新或重启后仍失败，'
                     '已停止并保留进度。') from error
             try:
                 driver = sys.modules['browser_session'].restart_browser(chrome, BASE, driver)
