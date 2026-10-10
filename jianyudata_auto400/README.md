@@ -9,17 +9,28 @@
 ## 入口
 
 - `run_scheduled_notebook.py`：Windows计划任务入口，启动Jupyter内核执行 `NIGHTLY_2100.ipynb`，每次只运行一轮。
-- 下载和 Salesforce 上传是两个独立任务。下载任务每天10:30运行，只保存并核验 Excel；上传任务每天11:00运行，只扫描本地未同步文件并通过 CLI 上传。两者分别发送简短汇总邮件，完整日志只保存在本机，不作为邮件附件发送。
+- 下载和 Salesforce 上传是两个独立任务。下载任务每天10:30运行，只保存并核验 Excel；上传任务每天11:00运行，只扫描本地未同步文件并通过 CLI 上传。10:50检查下载汇总，11:20把下载、沙盒上传和当天生产上传结果合并为一封邮件；完整日志只保存在本机。
 - `run_salesforce_sync.py`：独立 Salesforce 上传入口；失败时不推进同步清单，下次按唯一外部键安全重试。
 - `install_salesforce_upload_task.ps1`：继承正式任务的 Python 和登录用户，新建或更新每天11:00的 `Jianyu-Salesforce-Sync-1100`。
 - `nightly_job.py`：优先加载本目录独立模块，缺失时回退到 `START_AUTO.ipynb` 内嵌程序，连接和页面恢复最多尝试10次。登录失效时使用本机加密凭据尝试密码登录；需验证码时停止并提醒。
 - `START_AUTO.ipynb`：原交互Notebook，已清除输出。其手动调度时间及400条配置是旧入口，不用于每晚800条任务。
 - `setup_mail.ps1`：在本机输入Google应用专用密码，以当前Windows用户加密保存；不会发送测试邮件。
+- `setup_gmail_api.py`：一次性授权 Gmail HTTPS API，仅申请 `gmail.send` 权限；refresh token 用当前 Windows 用户的 DPAPI 加密保存，不进入 GitHub。
+- `mail_delivery.py`：持久化邮件队列。发送失败后30分钟重试，最多5次；默认收件人为公司邮箱和 `3531683877@qq.com`。
+- `install_mail_tasks.ps1`：注册10:50下载看门狗、11:20合并汇总和每5分钟检查一次的补发任务。
 - `setup_jianyu_login.ps1`：在本机输入剑鱼账号和密码，以当前Windows用户加密保存；登录仍有效时不会填写，登录失效时自动尝试密码登录。
 
 安装依赖：`python -m pip install -r requirements.txt`。
 
-Windows任务计划程序运行 `pythonw.exe`，参数是本目录 `run_scheduled_notebook.py` 的绝对路径，起始目录设为本目录。选择仅用户登录时运行、错过后补跑、已有实例时不启动新实例。当前执行时间为每天下午14:00，Chrome启动提前到13:59。已有任务可运行 `update_schedule_1400.ps1` 同步时间，其他触发器及启动配置保持不变；仅拉取GitHub代码不会修改本机任务时间。电脑接电禁止自动睡眠，允许关屏和锁屏；不要注销用户。
+Windows任务计划程序运行 `pythonw.exe`，参数是本目录脚本的绝对路径，起始目录设为本目录。选择仅用户登录时运行、错过后补跑、已有实例时不启动新实例。正式下载为10:30、上传为11:00、看门狗为10:50和11:20。电脑接电禁止自动睡眠，允许关屏和锁屏；不要注销用户。
+
+首次启用 HTTPS 邮件，需要在 Google Cloud 建立“桌面应用”OAuth 客户端并启用 Gmail API，下载客户端 JSON 后执行：
+
+```powershell
+python .\setup_gmail_api.py 'C:\路径\client_secret_xxx.json'
+```
+
+授权完成后主通道使用 HTTPS 443。授权完成前 SMTP 仍作为过渡备用；公司网络同时阻断 API 和 SMTP 时，邮件保留在 `D:\桌面\data\mail_queue`，不会因任务退出而丢失。
 
 Chrome由独立的 `Jianyu-Automation-Chrome` 计划任务启动并常驻。导出Notebook只连接该浏览器；导出成功或异常退出均不关闭整个Chrome。程序仍会关闭自己创建并已经完成的临时订单标签页。
 

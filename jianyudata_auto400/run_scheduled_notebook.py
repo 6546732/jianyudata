@@ -2,16 +2,13 @@
 import contextlib
 import ast
 import json
-import os
 import re
-import smtplib
-import ssl
-import subprocess
 import traceback
 import zipfile
 from datetime import datetime
-from email.message import EmailMessage
 from pathlib import Path
+
+from mail_delivery import enqueue_email
 
 ROOT = Path(__file__).resolve().parent
 BASE = Path(r'D:\桌面\data')
@@ -57,6 +54,8 @@ def collect_summary(log, started_at, failed=False, error_text='', expect_salesfo
     progress = _read_json(BASE / 'range_progress.json')
     completed = [record for record in progress.get('completed', [])
                  if record.get('quota_day') == day]
+    completed_dates = sorted({str(record.get('date')) for record in completed
+                              if record.get('date')})
     exported_rows = sum(int(record.get('count') or 0) for record in completed)
     valid_rows = 0
     invalid_files = []
@@ -109,10 +108,14 @@ def collect_summary(log, started_at, failed=False, error_text='', expect_salesfo
             'batches': len(completed), 'rows': exported_rows,
             'local_status': local_status, 'local_verified_rows': valid_rows,
             'invalid_files': invalid_files,
+            'completed_dates': completed_dates,
+            'completed_date_start': completed_dates[0] if completed_dates else None,
+            'completed_date_end': completed_dates[-1] if completed_dates else None,
             'progress_date': progress.get('current_date'),
             'progress_status': progress.get('status'),
             'remaining_quota': progress.get('remaining'),
             'pending_order': bool(progress.get('pending')),
+            'remaining_regions': len(progress.get('queue') or []),
         },
         'salesforce': {
             'status': ('成功' if upload_ok else
@@ -150,57 +153,8 @@ def summary_text(summary):
 
 
 def send_mail(subject, body):
-    config_file = ROOT / 'mail_config.json'
-    config = json.loads(config_file.read_text(encoding='utf-8')) if config_file.exists() else {}
-    host = config.get('host') or os.environ.get('SMTP_HOST')
-    if not host:
-        raise RuntimeError('SMTP服务器尚未配置，邮件未发送')
-    sender = config.get('sender', 'zihao.zhang@smartx.com')
-    user = config.get('username', sender)
-    password = os.environ.get('SMTP_PASSWORD', '')
-    credential = ROOT / 'mail_credential.xml'
-    if not password and credential.exists():
-        env = os.environ.copy()
-        env['JIANYU_MAIL_CREDENTIAL'] = str(credential)
-        result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
-            "$c=Import-Clixml -LiteralPath $env:JIANYU_MAIL_CREDENTIAL; $c.GetNetworkCredential().Password"],
-            capture_output=True, text=True, timeout=20, env=env,
-            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-        if result.returncode == 0:
-            password = result.stdout.strip()
-    # Google应用专用密码页面按四位分组显示，粘贴时可能带空格。
-    password = ''.join(password.split())
-    if not password:
-        raise RuntimeError('SMTP授权信息尚未配置，邮件未发送')
-    message = EmailMessage()
-    message['From'], message['To'] = sender, 'zihao.zhang@smartx.com'
-    message['Subject'] = subject
-    message.set_content(body)
-    configured = config.get('security', 'ssl')
-    if configured not in ('ssl', 'starttls'):
-        raise ValueError('只允许SSL或STARTTLS')
-    configured_port = int(config.get('port', 465 if configured == 'ssl' else 587))
-    attempts = [(configured, configured_port)]
-    # 公司网络可能阻断465；Gmail同时支持587 STARTTLS。
-    if host == 'smtp.gmail.com' and ('starttls', 587) not in attempts:
-        attempts.append(('starttls', 587))
-    errors = []
-    for security, port in attempts:
-        try:
-            if security == 'ssl':
-                client = smtplib.SMTP_SSL(host, port, timeout=30, context=ssl.create_default_context())
-            else:
-                client = smtplib.SMTP(host, port, timeout=30)
-            with client:
-                if security == 'starttls':
-                    client.starttls(context=ssl.create_default_context())
-                client.login(user, password)
-                if client.send_message(message):
-                    raise RuntimeError('邮件收件人被拒绝')
-            return
-        except (OSError, TimeoutError, smtplib.SMTPException) as error:
-            errors.append(f'{port}/{security}: {type(error).__name__}: {error}')
-    raise RuntimeError('；'.join(errors))
+    """Backward-compatible entry point; all mail now enters the retry queue."""
+    return enqueue_email(subject, body, kind='legacy', immediate=True)
 
 
 def alert(summary):
@@ -243,17 +197,8 @@ def main():
     summary = collect_summary(log, started_at, failed, error_text)
     summary_path = LOGS / (stamp + '-summary.json')
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
-    try:
-        alert(summary)
-        with log.open('a', encoding='utf-8') as stream:
-            print('运行汇总邮件已发送；未附加完整日志。', file=stream)
-    except Exception as error:
-        with log.open('a', encoding='utf-8') as stream:
-            print('邮件未发送：', type(error).__name__, str(error), file=stream)
-        (LOGS / (stamp + '-unsent.json')).write_text(json.dumps(
-            {'to': 'zihao.zhang@smartx.com', 'summary': str(summary_path),
-             'status': 'unsent', 'error': f'{type(error).__name__}: {error}'},
-            ensure_ascii=False), encoding='utf-8')
+    with log.open('a', encoding='utf-8') as stream:
+        print('下载汇总已保存；由11:20看门狗与上传结果合并后发送。', file=stream)
     return 1 if failed else 0
 
 if __name__ == '__main__':

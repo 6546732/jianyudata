@@ -216,8 +216,9 @@ class FastRange(ExportRange):
 def export_fast(driver, base=r'D:\桌面\data', start='2025-01-03', end=None,
                 confirm=False, daily_limit=400, strategy='prefix'):
     from selenium_range import SeleniumBackend
-    from automatic_ui import DeferredNotifier
+    from email_notice import QueuedEmailNotifier
     backend = SeleniumBackend(driver, base)
     backend.balance_day = start
     return FastRange(backend, base, start=start, end=end, confirm=confirm,
-                     daily_limit=daily_limit, strategy=strategy, notifier=DeferredNotifier()).run()
+                     daily_limit=daily_limit, strategy=strategy,
+                     notifier=QueuedEmailNotifier()).run()

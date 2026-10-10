@@ -25,6 +25,16 @@ class SalesforceSyncRunnerTest(unittest.TestCase):
         self.assertEqual(summary['uploaded_rows'], 790)
         self.assertEqual(summary['job_id'], '750xx')
 
+    def test_filter_breakdown_is_summed_for_mail(self):
+        with patch.object(runner, 'BASE', self.base):
+            summary = runner.build_summary(self.started, {
+                'status': 'uploaded', 'rows': 10,
+                'categories_filtered': {'合同': 3, '验收': 2},
+                'duplicates_filtered': 1,
+            })
+        self.assertEqual(summary['categories_filtered'], 5)
+        self.assertEqual(summary['duplicates_filtered'], 1)
+
     def test_failure_reports_zero_uploaded_and_reason(self):
         with patch.object(runner, 'BASE', self.base):
             summary = runner.build_summary(

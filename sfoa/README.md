@@ -28,7 +28,9 @@
 
 ## 每日自动入库
 
-Windows 下载任务 `Jianyu-Formal-1030` 每天 **10:30** 运行；`Jianyu-Automation-Chrome` 在 **10:29** 启动专用 Chrome。下载任务只负责剑鱼导出和本地 Excel 校验。独立上传任务 `Jianyu-Salesforce-Sync-1100` 每天 **11:00** 运行 `jianyudata_auto400/run_salesforce_sync.py`，扫描新 XLSX、按唯一键 Bulk upsert。只有 Salesforce 返回 0 失败并通过核验时才更新 `D:\桌面\data\sfoa_sync_manifest.json`；失败时下次自动重试未同步文件，不会访问剑鱼网站或重新扣额度。两个任务分别发送下载汇总与上传汇总，完整日志不随邮件发送。
+Windows 下载任务 `Jianyu-Formal-1030` 每天 **10:30** 运行；`Jianyu-Automation-Chrome` 在 **10:29** 启动专用 Chrome。下载任务只负责剑鱼导出和本地 Excel 校验。独立上传任务 `Jianyu-Salesforce-Sync-1100` 每天 **11:00** 运行 `jianyudata_auto400/run_salesforce_sync.py`，扫描新 XLSX、按唯一键 Bulk upsert。只有 Salesforce 返回 0 失败并通过核验时才更新 `D:\桌面\data\sfoa_sync_manifest.json`；失败时下次自动重试未同步文件，不会访问剑鱼网站或重新扣额度。11:20 看门狗把下载、沙盒上传和当天生产上传结果合并成一封邮件，完整日志不随邮件发送。
+
+11:00 上传任务会先用 `sfoa/salesforce_auth.py` 执行 JWT 登录，刷新 `zihao` 沙盒的 CLI 令牌，再开始 Bulk upsert。JWT 不使用 Salesforce 密码，也不会打开浏览器；私钥只保存在 `D:\桌面\data\secrets\salesforce-jwt-zihao\server.key`，代码库中仅保存非机密的用户名、Consumer Key、沙盒地址和预期组织 ID。任务会同时核对组织 ID 与 `isSandbox`，防止误传生产环境。
 
 自信息类型筛选更新后，新增导出与入库只保留“招标公告”整组（招标、邀标、询价、竞谈、单一、竞价、变更）及“招标结果”中的中标、成交。上传前仍按 `Publication_Category__c` 对 Excel 行进行第二次过滤，`prepare_report.json` 的 `categories_skipped` 记录排除数量。已经上传的其他类型标讯不会被此变更自动删除；如需清理历史记录，应先单独核对数量与范围。
 
@@ -42,16 +44,21 @@ Windows 下载任务 `Jianyu-Formal-1030` 每天 **10:30** 运行；`Jianyu-Auto
 
 ## 上传到生产环境
 
-Excel 明细不需要制作 Salesforce 安装包。生产组织必须先部署 `bidnews__c` 对象、字段、权限及其依赖的 Apex/LWC 元数据，再用同一个 Bulk upsert 脚本导入数据。先为生产组织建立独立 CLI 授权和别名（以下假设别名为 `prod`），确认 `Source_Key__c` 是唯一 External ID，并执行：
+Excel 明细不需要制作 Salesforce 安装包。生产组织必须先部署 `bidnews__c` 对象、字段、权限及其依赖的 Apex/LWC 元数据，再用同一个 Bulk upsert 脚本导入数据。生产别名固定为 `sfoa-prod`。先运行只读预演，它会逐项检查上传 CSV 的全部字段、`Source_Key__c` 的唯一 External ID 配置，并统计生产中已有记录与待新增记录：
 
 ```powershell
-& 'C:\Users\Administrator\AppData\Local\Programs\Python\Python314\python.exe' `
-  '.\sfoa\sync_to_salesforce.py' `
-  --base 'D:\桌面\data' `
-  --target-org prod
+& '.\sfoa\upload_production.ps1'
 ```
 
-上传脚本会按组织隔离输出目录、运行锁和同步清单。`zihao` 沙盒继续使用原来的 `sfoa_upload`、`sfoa_sync_manifest.json` 和 `sfoa_sync.lock`；生产别名 `prod` 使用 `sfoa_upload_prod`、`sfoa_sync_manifest_prod.json` 和 `sfoa_sync_prod.lock`。因此同一批本地 Excel 可以分别上传到沙盒和生产，生产任务不会因为沙盒清单已记录而跳过文件。不要对生产环境使用 `--force`，除非已核对上传范围并明确需要全量重传。
+预演结果写入 `D:\桌面\data\sfoa_upload_sfoa-prod\production_preflight.json`，不会创建或修改 Salesforce 记录。只有结果为 `ready` 且 `safe_to_execute=true` 时才执行正式上传：
+
+```powershell
+& '.\sfoa\upload_production.ps1' -Execute
+```
+
+上传脚本会按组织隔离输出目录、运行锁和同步清单。`zihao` 沙盒继续使用原来的 `sfoa_upload`、`sfoa_sync_manifest.json` 和 `sfoa_sync.lock`；生产别名 `sfoa-prod` 使用 `sfoa_upload_sfoa-prod`、`sfoa_sync_manifest_sfoa-prod.json` 和 `sfoa_sync_sfoa-prod.lock`。因此同一批本地 Excel 可以分别上传到沙盒和生产，生产任务不会因为沙盒清单已记录而跳过文件。
+
+正式上传使用 `Source_Key__c` 做 Bulk Upsert。生产中已有相同外部键的手工记录会被更新，不会新增重复记录；没有 `Source_Key__c` 的手工记录无法可靠自动对应，预演会显示 `remote_rows_without_key` 并阻止上传，必须先补齐外部键。不要对生产环境使用 `-Force`，除非已核对上传范围并明确需要全量重传。
 
 ## AI 标签
 

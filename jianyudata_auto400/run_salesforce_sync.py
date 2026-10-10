@@ -6,11 +6,15 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from run_scheduled_notebook import _failure_reason, _read_json, send_mail
+from run_scheduled_notebook import _failure_reason, _read_json
 
 ROOT = Path(__file__).resolve().parent
 BASE = Path(r'D:\桌面\data')
 LOGS = BASE / 'logs'
+
+
+def _count(value):
+    return sum(int(item or 0) for item in value.values()) if isinstance(value, dict) else int(value or 0)
 
 
 def build_summary(started_at, result=None, error_text=''):
@@ -21,14 +25,23 @@ def build_summary(started_at, result=None, error_text=''):
     success = isinstance(result, dict) and result.get('status') in {
         'uploaded', 'unchanged', 'reconciled'
     }
+    details = result or {}
     return {
         'run_started_at': started_at.isoformat(),
         'run_finished_at': datetime.now().isoformat(),
+        'target_org': details.get('target_org', 'zihao'),
+        'environment': details.get('environment', '沙盒'),
         'status': '成功' if success else '失败',
         'source_files': int(report.get('source_files') or 0) if report_is_current else None,
         'rows_read': int(report.get('rows_read') or 0) if report_is_current else None,
         'attempted_rows': int(report.get('rows_written') or 0) if report_is_current else None,
         'uploaded_rows': int((result or {}).get('rows') or 0) if success else 0,
+        'successful_rows': int(details.get('successful_rows', details.get('rows', 0)) or 0) if success else 0,
+        'failed_rows': int(details.get('failed_rows') or 0),
+        'inserted_rows': details.get('inserted_rows'),
+        'updated_rows': details.get('updated_rows'),
+        'duplicates_filtered': _count(details.get('duplicates_filtered', details.get('duplicates_in_batch', 0))),
+        'categories_filtered': _count(details.get('categories_filtered')),
         'job_id': (result or {}).get('job_id') if success else None,
         'details': result,
         'failure_reason': '' if success else _failure_reason(error_text),
@@ -73,7 +86,10 @@ def main():
             if not sfoa_directory.is_dir():
                 raise RuntimeError('未找到 sfoa 同步模块')
             sys.path.insert(0, str(sfoa_directory))
+            from salesforce_auth import login_zihao_jwt
             from sync_to_salesforce import sync
+            authentication = login_zihao_jwt(alias='zihao')
+            print('Salesforce JWT 认证：', authentication, flush=True)
             result = sync(BASE, target_org='zihao')
             print('Salesforce 同步：', result, flush=True)
         except Exception:
@@ -84,19 +100,8 @@ def main():
     summary = build_summary(started_at, result, error_text)
     summary_path = LOGS / f'salesforce-{stamp}-summary.json'
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
-    try:
-        send_mail(
-            f"剑鱼上传汇总：{summary['uploaded_rows']}条，{summary['status']} {started_at:%Y-%m-%d}",
-            summary_text(summary))
-        with log.open('a', encoding='utf-8') as stream:
-            print('上传汇总邮件已发送；未附加完整日志。', file=stream)
-    except Exception as mail_error:
-        with log.open('a', encoding='utf-8') as stream:
-            print('邮件未发送：', type(mail_error).__name__, str(mail_error), file=stream)
-        (LOGS / f'salesforce-{stamp}-unsent.json').write_text(json.dumps({
-            'to': 'zihao.zhang@smartx.com', 'summary': str(summary_path),
-            'status': 'unsent', 'error': f'{type(mail_error).__name__}: {mail_error}',
-        }, ensure_ascii=False), encoding='utf-8')
+    with log.open('a', encoding='utf-8') as stream:
+        print('上传汇总已保存；由11:20看门狗与下载结果合并后发送。', file=stream)
     return 1 if error_text else 0
 
 

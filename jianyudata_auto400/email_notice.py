@@ -6,6 +6,25 @@ import ssl
 from email.message import EmailMessage
 
 
+class QueuedEmailNotifier:
+    """Persist province-over-limit alerts and use the shared real mail channel."""
+
+    def send(self, record):
+        from mail_delivery import enqueue_email
+        subject = (f"[剑鱼自动化][省份超额] {record['date']} "
+                   f"{record['region']} {record['count']}条，已跳过")
+        body = (
+            f"标讯日期：{record['date']}\n省份：{record['region']}\n"
+            f"查询数据量：{record['count']} 条\n每日额度：800 条\n"
+            "关键词：超融合、分布式存储、私有云、虚拟化；匹配方式：全选。\n"
+            "处理结果：该省超过单日限额，未扣额度并继续后续地区。\n"
+        )
+        return enqueue_email(
+            subject, body, kind="province_over_limit", environment="下载",
+            dedupe_key=f"province-over:{record['date']}:{record['region']}",
+            immediate=True)
+
+
 class SMTPNotifier:
     def __init__(self, host, port, sender, recipient, username='', password='', security='ssl'):
         if not host or not sender or not recipient:

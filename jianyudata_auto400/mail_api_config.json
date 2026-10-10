@@ -1,0 +1,14 @@
+{
+  "provider": "gmail_api",
+  "sender": "zihao.zhang@smartx.com",
+  "recipients": [
+    "zihao.zhang@smartx.com",
+    "3531683877@qq.com"
+  ],
+  "credential_file": "mail_api_credential.xml",
+  "token_url": "https://oauth2.googleapis.com/token",
+  "send_url": "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+  "retry_minutes": 30,
+  "max_attempts": 5,
+  "smtp_fallback": true
+}

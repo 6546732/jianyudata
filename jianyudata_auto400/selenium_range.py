@@ -6,7 +6,7 @@ from selenium.webdriver.common.by import By
 
 from export_one_day import OneDay, FILTER_URL, xlsx_rows
 from export_range import ExportRange
-from email_notice import SMTPNotifier
+from email_notice import QueuedEmailNotifier, SMTPNotifier
 from automatic_ui import AutomaticUI, DeferredNotifier
 
 
@@ -190,7 +190,7 @@ def export_range(driver, base=r'D:\桌面\data', start='2025-01-01', end=None,
                  confirm=False, ui=None, notifier=None, daily_limit=200):
     """end=None：本次运行当天；每日重新调用即从原进度继续。"""
     if confirm and notifier is None:
-        notifier = DeferredNotifier()
+        notifier = QueuedEmailNotifier()
     backend = SeleniumBackend(driver, base, ui)
     backend.balance_day = start
     return ExportRange(backend, base, start, end,
