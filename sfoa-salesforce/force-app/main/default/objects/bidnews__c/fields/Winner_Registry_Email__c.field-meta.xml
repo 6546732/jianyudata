@@ -3,6 +3,6 @@
     <fullName>Winner_Registry_Email__c</fullName>
     <label>企业公示中标单位邮箱</label>
     <type>LongTextArea</type>
-    <length>1024</length>
+    <length>131072</length>
     <visibleLines>10</visibleLines>
 </CustomField>

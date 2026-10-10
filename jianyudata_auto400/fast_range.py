@@ -54,21 +54,36 @@ class FastRange(ExportRange):
                 raise RuntimeError('省份列表为空或重复')
             combined = self.count(names)
             print(f'覆盖校验：{day} 全国{count}条，全部省份组合{combined}条', flush=True)
-            # 完整选择当天可用地区后，允许按用户授权省略非省份覆盖差额。
-            # 再查全国，避免将查询期间的数据变化误记为可省略差额。
-            if combined > count:
-                raise RuntimeError('省份组合比全国更多，未提交，请检查数据或筛选条件')
-            if combined < count:
-                national_after = self.count([])
-                if national_after != count:
-                    raise RuntimeError('全国数量发生变化，未提交，请重新运行')
-                omitted = {'date': day, 'count': count - combined,
+            # 全国与省份合计可能因“全国”归属记录或查询期间数据变化而不一致。
+            # 用户已明确允许 20 条以内的差异；超过容差才停止且绝不提交。
+            national_after = self.count([])
+            national_change = abs(national_after - count)
+            if national_change > QUERY_COUNT_TOLERANCE:
+                raise RecoverablePageError(
+                    f'全国复查相差{national_change}条，超过允许的'
+                    f'{QUERY_COUNT_TOLERANCE}条，未提交')
+            if national_after != count:
+                print(f'全国复查由{count}条变为{national_after}条，相差'
+                      f'{national_change}条；采用复查值。', flush=True)
+                count = national_after
+
+            coverage_difference = count - combined
+            if abs(coverage_difference) > QUERY_COUNT_TOLERANCE:
+                raise RecoverablePageError(
+                    f'全国与全部省份组合相差{abs(coverage_difference)}条，超过允许的'
+                    f'{QUERY_COUNT_TOLERANCE}条，未提交')
+            if coverage_difference > 0:
+                omitted = {'date': day, 'count': coverage_difference,
                            'national_count': count, 'province_count': combined,
                            'reason': 'non_province_difference_user_authorized'}
                 records = self.state.setdefault('omitted_national', [])
                 records[:] = [r for r in records if r['date'] != day]
                 records.append(omitted)
-                print(f'{day} 按省份拆分：记录省略差额{count - combined}条（用户允许省略全国归属记录）', flush=True)
+                print(f'{day} 按省份拆分：记录全国归属差额{coverage_difference}条'
+                      f'（不超过{QUERY_COUNT_TOLERANCE}条，继续）', flush=True)
+            elif coverage_difference < 0:
+                print(f'{day} 省份组合比全国复查多{-coverage_difference}条'
+                      f'（不超过{QUERY_COUNT_TOLERANCE}条，继续）', flush=True)
             self.state['national_count'] = count
             self.state['queue'] = [{'region': n, 'count': None} for n in names]
         self.save()
