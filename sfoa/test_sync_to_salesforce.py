@@ -1,3 +1,4 @@
+import csv
 import json
 import tempfile
 import unittest
@@ -6,6 +7,32 @@ from pathlib import Path
 from unittest.mock import patch
 
 import sync_to_salesforce as syncer
+
+
+class LegacyOverlapTests(unittest.TestCase):
+    def test_reviewed_history_is_not_uploaded_and_changed_files_are_pending(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            (base / "downloads").mkdir()
+            file = base / "downloads" / "history.xlsx"
+            file.write_bytes(b"reviewed")
+            _, manifest, _ = syncer._state_paths(base, "sfoa-prod")
+            manifest.write_text(json.dumps({"files": {}, "reviewed_files": {
+                str(file.resolve()): syncer.digest(file)}}), encoding="utf-8")
+            self.assertEqual(syncer._pending_files(base, False, "sfoa-prod")[3], [])
+            self.assertEqual(syncer._pending_files(base, True, "sfoa-prod")[3], [file])
+            file.write_bytes(b"changed")
+            self.assertEqual(syncer._pending_files(base, False, "sfoa-prod")[3], [file])
+
+    def test_legacy_fallback_detects_overlap_without_external_key(self):
+        local = [{"Full_Title__c": "采购公告", "Buyer_Name__c": "单位甲", "release_date__c": "2025-06-01"}]
+        remote = [{"Name": "采购公告", "accountname__c": "单位甲", "release_date__c": "2025-06-01"}]
+        self.assertEqual(syncer.legacy_overlap_count(local, remote), 1)
+        remote[0]["release_date__c"] = "2025-06-02"
+        self.assertEqual(syncer.legacy_overlap_count(local, remote), 0)
+
+    def test_empty_identity_is_not_a_match(self):
+        self.assertEqual(syncer.legacy_overlap_count([{}], [{}]), 0)
 
 
 def job(job_id="750TEST", rows=12, state="JobComplete", failed=0,
@@ -23,6 +50,59 @@ def job(job_id="750TEST", rows=12, state="JobComplete", failed=0,
 
 
 class BulkJobRecoveryTests(unittest.TestCase):
+    def test_blocked_queue_preserves_other_files_and_replaces_rescanned_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            first = base / "downloads" / "first.xlsx"
+            second = base / "downloads" / "second.xlsx"
+            first.parent.mkdir()
+            first.touch()
+            second.touch()
+            output = base / "upload"
+            output.mkdir()
+            queue = output / "blocked_rows_pending.csv"
+            run = output / "blocked_rows_run.csv"
+
+            def row(path, row_number, title):
+                value = {field: "" for field in syncer.BLOCKED_FIELDS}
+                value.update(Source_File_Path=str(path.resolve()),
+                             Source_Row_Number__c=str(row_number),
+                             Full_Title__c=title)
+                return value
+
+            with queue.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=syncer.BLOCKED_FIELDS)
+                writer.writeheader()
+                writer.writerows([row(first, 3, "旧第一条"), row(second, 4, "第二文件")])
+            with run.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=syncer.BLOCKED_FIELDS)
+                writer.writeheader()
+                writer.writerow(row(first, 5, "新第一条"))
+
+            count = syncer._merge_blocked_queue(queue, run, [first])
+            with queue.open(newline="", encoding="utf-8") as stream:
+                queued = list(csv.DictReader(stream))
+            self.assertEqual(count, 2)
+            self.assertEqual({item["Full_Title__c"] for item in queued},
+                             {"新第一条", "第二文件"})
+
+    def test_sync_reports_pending_blocked_rows_without_reprocessing_source_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            output, _, _ = syncer._state_paths(base, "zihao")
+            output.mkdir(parents=True)
+            queue = output / "blocked_rows_pending.csv"
+            row = {field: "" for field in syncer.BLOCKED_FIELDS}
+            row.update(Source_File_Path="source.xlsx", Source_Row_Number__c="4")
+            with queue.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=syncer.BLOCKED_FIELDS)
+                writer.writeheader()
+                writer.writerow(row)
+
+            result = syncer.sync(base, target_org="zihao")
+            self.assertEqual(result["status"], "blocked_pending")
+            self.assertEqual(result["blocked_rows"], 1)
+
     def test_sandbox_keeps_legacy_state_paths(self):
         base = Path(tempfile.gettempdir()) / "jianyu-test"
         output, manifest, lock = syncer._state_paths(base, "zihao")
@@ -56,6 +136,61 @@ class BulkJobRecoveryTests(unittest.TestCase):
         result = syncer.assess_target_schema({"name": "bidnews__c", "fields": fields})
         self.assertEqual(result["missing_fields"], ["Full_Title__c"])
 
+    def test_production_profile_uses_new_precise_amount_fields(self):
+        fields = syncer.upload_fields("sfoa-prod")
+        self.assertIn("Source_Budget__c", fields)
+        self.assertIn("Source_Winning_Wan__c", fields)
+        self.assertNotIn("Source_Budget_Wan__c", fields)
+        self.assertIn("accountname__c", fields)
+        self.assertIn("bidwinningname__c", fields)
+        self.assertIn("website__c", fields)
+        self.assertEqual(len(fields), len(set(fields)))
+
+    def test_production_csv_contains_only_compact_fields(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+            source = output / "bidnews_upsert.csv"
+            row = {name: "" for name in syncer.FIELDS}
+            row.update(Source_Key__c="a" * 64, Name="标题",
+                       Publication_Category__c="招标", Tender_Stage__c="招标中",
+                       Buyer_Contact__c="测试联系人", Buyer_Phone__c="021-00000000",
+                       Source_Budget_Wan__c="12.345",
+                       Source_Winning_Wan__c="8.001")
+            with source.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=syncer.FIELDS)
+                writer.writeheader()
+                writer.writerow(row)
+            production = syncer.upload_csv(output, "sfoa-prod")
+            with production.open(newline="", encoding="utf-8-sig") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(list(rows[0]), syncer.upload_fields("sfoa-prod"))
+            self.assertEqual(rows[0]["Source_Budget__c"], "12.35")
+            self.assertEqual(rows[0]["Source_Winning_Wan__c"], "8.001")
+            for field in ("Publication_Category__c", "Tender_Stage__c",
+                          "Buyer_Contact__c", "Buyer_Phone__c"):
+                self.assertEqual(rows[0][field], row[field])
+
+    @patch.object(syncer, "sf_query_all")
+    def test_legacy_field_plan_only_fills_blank_new_fields(self, query):
+        query.return_value = [{
+            "Id": "a01", "Name": "旧标题", "Full_Title__c": None,
+            "accountname__c": "旧采购单位", "Buyer_Name__c": "已有新值",
+            "bidwinningname__c": "旧中标单位", "Winner_Name__c": "",
+            "budget__c": 12, "Source_Budget__c": None,
+            "bidwinningamount__c": 8, "Source_Winning_Wan__c": 9,
+            "website__c": "https://old", "Announcement_Url_Full__c": None,
+        }]
+        with tempfile.TemporaryDirectory() as folder:
+            result = syncer.prepare_legacy_field_backfill("sfoa-prod", Path(folder))
+            with Path(result["backfill_csv"]).open(
+                    newline="", encoding="utf-8-sig") as stream:
+                row = next(csv.DictReader(stream))
+        self.assertEqual(result["rows_to_update"], 1)
+        self.assertEqual(row["Full_Title__c"], "旧标题")
+        self.assertEqual(row["Buyer_Name__c"], "已有新值")
+        self.assertEqual(row["Source_Budget__c"], "12")
+        self.assertEqual(row["Source_Winning_Wan__c"], "9")
+
     def test_existing_external_ids_are_updates_not_inserts(self):
         result = syncer.compare_external_ids(
             ["a" * 64, "b" * 64, "c" * 64],
@@ -68,6 +203,28 @@ class BulkJobRecoveryTests(unittest.TestCase):
         result = syncer.compare_external_ids(["a" * 64], [], 3)
         self.assertEqual(result["remote_rows_without_key"], 3)
         self.assertFalse(result["safe_to_upsert"])
+
+    def test_production_cutover_can_ignore_legacy_rows_without_key(self):
+        result = syncer.compare_external_ids(
+            ["a" * 64], [], 7188, ignore_remote_without_key=True)
+        self.assertEqual(result["legacy_rows_ignored"], 7188)
+        self.assertTrue(result["safe_to_upsert"])
+
+    def test_initialize_production_cutover_marks_current_files_processed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            downloads = base / "downloads"
+            downloads.mkdir()
+            (downloads / "old.xlsx").write_bytes(b"legacy")
+            result = syncer.initialize_production_cutover(base)
+            self.assertEqual(result["legacy_files_ignored"], 1)
+            _, _, _, pending, _ = syncer._pending_files(
+                base, target_org="sfoa-prod")
+            self.assertEqual(pending, [])
+            (downloads / "new.xlsx").write_bytes(b"new")
+            _, _, _, pending, _ = syncer._pending_files(
+                base, target_org="sfoa-prod")
+            self.assertEqual([path.name for path in pending], ["new.xlsx"])
 
     def test_direct_production_sync_is_blocked_without_preflight(self):
         with patch.dict(syncer.os.environ, {}, clear=False):

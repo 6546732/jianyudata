@@ -43,6 +43,7 @@ OPEN = {"招标", "邀标", "竞价", "竞谈", "询价", "磋商", "单一", "�
 ALLOWED_CATEGORIES = frozenset({
     "招标", "邀标", "询价", "竞谈", "单一", "竞价", "变更", "中标", "成交",
 })
+MAX_CONTENT_CHARS = 131072
 HYPERLINK = re.compile(
     # Jianyu sometimes puts unescaped quotation marks in the visible title.
     # The target URL has no quotes; take the rest through the final quote as
@@ -155,9 +156,6 @@ def record(row, file_name: str, errors: Counter) -> dict:
         "swordfishwebsite__c": clean(row[10]),
         "Source_File__c": file_name[:255],
     }
-    if len(content) > 131072:
-        errors["content_too_long"] += 1
-        raise ValueError("公告正文超过 Salesforce 字段上限；停止而非截断")
     if not result["release_date__c"] or not content:
         errors["missing_key_data"] += 1
         raise ValueError("公告缺少发布日期或正文；停止而非上传不完整记录")
@@ -166,21 +164,31 @@ def record(row, file_name: str, errors: Counter) -> dict:
     return result
 
 
-def prepare(root: Path, output: Path, selected_files=None) -> dict:
+BLOCKED_FIELDS = FIELDS + ["Source_File_Path", "Content_Length", "Block_Reason"]
+
+
+def prepare(root: Path, output: Path, selected_files=None,
+            blocked_output: Path | None = None) -> dict:
     files = sorted(selected_files if selected_files is not None else
                    (p for p in root.rglob("*.xlsx") if not p.name.startswith("~$")))
     if not files:
         raise FileNotFoundError(f"没有找到 XLSX：{root}")
     output.mkdir(parents=True, exist_ok=True)
     csv_path = output / "bidnews_upsert.csv"
+    blocked_path = blocked_output or output / "blocked_rows_run.csv"
+    blocked_path.parent.mkdir(parents=True, exist_ok=True)
     errors: Counter = Counter()
     by_date: Counter = Counter()
     seen: set[str] = set()
-    rows_read = rows_written = duplicates = 0
+    rows_read = rows_written = blocked_rows = duplicates = 0
     categories_skipped: Counter = Counter()
-    with csv_path.open("w", newline="", encoding="utf-8") as stream:
+    with (csv_path.open("w", newline="", encoding="utf-8") as stream,
+          blocked_path.open("w", newline="", encoding="utf-8") as blocked_stream):
         writer = csv.DictWriter(stream, fieldnames=FIELDS, lineterminator="\r\n")
+        blocked_writer = csv.DictWriter(
+            blocked_stream, fieldnames=BLOCKED_FIELDS, lineterminator="\r\n")
         writer.writeheader()
+        blocked_writer.writeheader()
         for path in files:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="Workbook contains no default style")
@@ -209,6 +217,18 @@ def prepare(root: Path, output: Path, selected_files=None) -> dict:
                         duplicates += 1
                         continue
                     seen.add(item["Source_Key__c"])
+                    content_length = len(item["Source_Content__c"])
+                    if content_length > MAX_CONTENT_CHARS:
+                        blocked_writer.writerow({
+                            **item,
+                            "Source_File_Path": str(path.resolve()),
+                            "Content_Length": content_length,
+                            "Block_Reason": (
+                                f"公告正文 {content_length} 字符，超过 Salesforce "
+                                f"字段上限 {MAX_CONTENT_CHARS}；原文已完整保存在本机待处理队列"),
+                        })
+                        blocked_rows += 1
+                        continue
                     writer.writerow(item)
                     rows_written += 1
                     by_date[item["release_date__c"]] += 1
@@ -217,6 +237,8 @@ def prepare(root: Path, output: Path, selected_files=None) -> dict:
     report = {
         "source_files": len(files), "rows_read": rows_read,
         "rows_written": rows_written, "duplicates_skipped": duplicates,
+        "blocked_rows": blocked_rows,
+        "blocked_rows_file": str(blocked_path),
         "categories_skipped": dict(categories_skipped),
         "allowed_categories": sorted(ALLOWED_CATEGORIES),
         "warnings": dict(errors), "by_date": dict(by_date),

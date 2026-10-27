@@ -17,15 +17,84 @@ import time
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from urllib.parse import quote
 
-from prepare_import import FIELDS, prepare
+from prepare_import import BLOCKED_FIELDS, FIELDS, prepare
 
 NODE = Path(os.environ.get("SFOA_NODE", "D:/install/SOFTWARE DOWNLOAD/sf/client/bin/node.exe"))
 SF_CLI = Path(os.environ.get("SFOA_CLI", "D:/install/SOFTWARE DOWNLOAD/sf/client/bin/run.js"))
 DEFAULT_BASE = Path(r"D:\桌面\data")
 BULK_API_VERSION = os.environ.get("SFOA_API_VERSION", "67.0")
+
+# Production intentionally keeps a compact schema. Values are read from the
+# full local CSV, then written under the production field name on the right.
+PRODUCTION_FIELD_MAP = {
+    "Source_Key__c": "Source_Key__c",
+    "Name": "Name",
+    "Full_Title__c": "Full_Title__c",
+    "Project_Name__c": "Project_Name__c",
+    "Matching_Keywords__c": "Matching_Keywords__c",
+    "bidstate__c": "bidstate__c",
+    "bidcity__c": "bidcity__c",
+    "type__c": "type__c",
+    "Publication_Category__c": "Publication_Category__c",
+    "Tender_Stage__c": "Tender_Stage__c",
+    "Buyer_Contact__c": "Buyer_Contact__c",
+    "Buyer_Phone__c": "Buyer_Phone__c",
+    "release_date__c": "release_date__c",
+    "Source_Industry__c": "Source_Industry__c",
+    "Buyer_Name__c": "Buyer_Name__c",
+    "Winner_Name__c": "Winner_Name__c",
+    "accountname__c": "accountname__c",
+    "bidwinningname__c": "bidwinningname__c",
+    "projectnumber__c": "projectnumber__c",
+    "Source_Budget_Wan__c": "Source_Budget__c",
+    "Source_Winning_Wan__c": "Source_Winning_Wan__c",
+    "content__c": "content__c",
+    "bidopeningdate__c": "bidopeningdate__c",
+    "biddeadline__c": "biddeadline__c",
+    "website__c": "website__c",
+    "Announcement_Url_Full__c": "Announcement_Url_Full__c",
+    "swordfishwebsite__c": "swordfishwebsite__c",
+}
+
+
+def upload_fields(target_org: str) -> list[str]:
+    return (list(PRODUCTION_FIELD_MAP.values())
+            if target_org == "sfoa-prod" else list(FIELDS))
+
+
+def upload_csv(output: Path, target_org: str) -> Path:
+    """Create the compact production CSV without changing sandbox output."""
+    source = output / "bidnews_upsert.csv"
+    if target_org != "sfoa-prod":
+        return source
+    destination = output / "bidnews_upsert_production.csv"
+    with source.open(newline="", encoding="utf-8") as input_stream, \
+            destination.open("w", newline="", encoding="utf-8-sig") as output_stream:
+        reader = csv.DictReader(input_stream)
+        writer = csv.DictWriter(output_stream,
+                                fieldnames=list(PRODUCTION_FIELD_MAP.values()),
+                                lineterminator="\r\n")
+        writer.writeheader()
+        for row in reader:
+            converted = {target: row.get(source_name, "")
+                         for source_name, target in PRODUCTION_FIELD_MAP.items()}
+            for target, quantum in (("Source_Budget__c", Decimal("0.01")),
+                                    ("Source_Winning_Wan__c", Decimal("0.001"))):
+                value = str(converted.get(target) or "").strip()
+                if not value:
+                    continue
+                try:
+                    amount = Decimal(value)
+                except InvalidOperation as error:
+                    raise ValueError(f"生产金额不是有效数字：{value}") from error
+                rounded = amount.quantize(quantum, rounding=ROUND_HALF_UP)
+                converted[target] = format(rounded, "f")
+            writer.writerow(converted)
+    return destination
 
 
 def _sf_environment() -> dict:
@@ -101,16 +170,17 @@ def sf_query_all(target_org: str, soql: str) -> list[dict]:
     return records
 
 
-def assess_target_schema(description: dict) -> dict:
+def assess_target_schema(description: dict, required_fields=None) -> dict:
     """Check every CSV field plus the external ID contract used by Bulk Upsert."""
+    required_fields = list(required_fields or FIELDS)
     fields = {field.get("name"): field for field in description.get("fields") or []}
-    missing = sorted(set(FIELDS) - set(fields))
+    missing = sorted(set(required_fields) - set(fields))
     not_createable = sorted(
-        name for name in FIELDS
+        name for name in required_fields
         if name in fields and not fields[name].get("createable", False)
     )
     not_updateable = sorted(
-        name for name in FIELDS
+        name for name in required_fields
         if name in fields and not fields[name].get("updateable", False)
     )
     source_key = fields.get("Source_Key__c") or {}
@@ -125,7 +195,8 @@ def assess_target_schema(description: dict) -> dict:
 
 
 def compare_external_ids(local_keys: list[str], remote_keys: list[str],
-                         remote_without_key: int) -> dict:
+                         remote_without_key: int,
+                         ignore_remote_without_key: bool = False) -> dict:
     """Show what an upsert would insert/update and detect unsafe remote state."""
     local_counts = Counter(local_keys)
     remote_counts = Counter(key for key in remote_keys if key)
@@ -143,9 +214,23 @@ def compare_external_ids(local_keys: list[str], remote_keys: list[str],
         "remote_rows_without_key": int(remote_without_key),
         "duplicate_local_keys": len(duplicate_local),
         "duplicate_remote_keys": len(duplicate_remote),
+        "legacy_rows_ignored": (int(remote_without_key)
+                                if ignore_remote_without_key else 0),
         "safe_to_upsert": not duplicate_local and not duplicate_remote
-                          and int(remote_without_key) == 0,
+                          and (ignore_remote_without_key
+                               or int(remote_without_key) == 0),
     }
+
+
+def legacy_overlap_count(local_rows: list[dict], remote_rows: list[dict]) -> int:
+    """Flag likely legacy duplicates for review; never auto-merge on this key."""
+    def identity(row):
+        title = str(row.get("Full_Title__c") or row.get("Name") or "").strip()
+        buyer = str(row.get("Buyer_Name__c") or row.get("accountname__c") or "").strip()
+        published = row.get("release_date__c")
+        return (title, buyer, published) if title and published else None
+    identities = {identity(row) for row in remote_rows} - {None}
+    return sum(identity(row) in identities for row in local_rows)
 
 
 def _unique_index(rows: list[dict], key_function) -> dict[object, str]:
@@ -187,6 +272,7 @@ def match_legacy_rows(local_rows: list[dict], remote_rows: list[dict]) -> tuple[
             local_rows, composite_without_number),
     }
     preliminary: list[dict] = []
+    review_rows: list[dict] = []
     ambiguous = 0
     unmatched = 0
     for remote in remote_rows:
@@ -209,11 +295,33 @@ def match_legacy_rows(local_rows: list[dict], remote_rows: list[dict]) -> tuple[
             })
         elif len(unique) > 1:
             ambiguous += 1
+            review_rows.append({
+                "Reason": "ambiguous_identifiers", "Id": text(remote, "Id"),
+                "Name": text(remote, "Name"),
+                "Release_Date": text(remote, "release_date__c"),
+                "Province": text(remote, "bidstate__c"),
+                "City": text(remote, "bidcity__c"),
+                "Candidate_Source_Keys": ";".join(sorted(unique)),
+                "Match_Methods": ",".join(sorted(candidates)),
+            })
         else:
             unmatched += 1
     by_key = Counter(row["Source_Key__c"] for row in preliminary)
     collisions = sum(1 for count in by_key.values() if count > 1)
     matched = [row for row in preliminary if by_key[row["Source_Key__c"]] == 1]
+    colliding = [row for row in preliminary if by_key[row["Source_Key__c"]] > 1]
+    remote_by_id = {text(row, "Id"): row for row in remote_rows}
+    for row in colliding:
+        remote = remote_by_id.get(row["Id"], {})
+        review_rows.append({
+            "Reason": "multiple_remote_rows_for_one_source_key",
+            "Id": row["Id"], "Name": text(remote, "Name"),
+            "Release_Date": text(remote, "release_date__c"),
+            "Province": text(remote, "bidstate__c"),
+            "City": text(remote, "bidcity__c"),
+            "Candidate_Source_Keys": row["Source_Key__c"],
+            "Match_Methods": row["Match_Methods"],
+        })
     colliding_rows = sum(count for count in by_key.values() if count > 1)
     method_counts = Counter()
     for row in matched:
@@ -227,6 +335,7 @@ def match_legacy_rows(local_rows: list[dict], remote_rows: list[dict]) -> tuple[
         "colliding_remote_rows": colliding_rows,
         "match_method_counts": dict(method_counts),
         "safe_backfill_rows": len(matched),
+        "_review_rows": review_rows,
     }
     return matched, report
 
@@ -238,6 +347,7 @@ def prepare_legacy_backfill(local_rows: list[dict], target_org: str,
               "website__c,swordfishwebsite__c,projectnumber__c,content__c")
     remote_rows = sf_query_all(target_org, f"SELECT {fields} FROM bidnews__c")
     matches, report = match_legacy_rows(local_rows, remote_rows)
+    review_rows = report.pop("_review_rows", [])
     path = output / "production_source_key_backfill.csv"
     with path.open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(
@@ -246,7 +356,66 @@ def prepare_legacy_backfill(local_rows: list[dict], target_org: str,
         writer.writeheader()
         writer.writerows(matches)
     report["backfill_csv"] = str(path)
+    review_path = output / "production_source_key_review.csv"
+    with review_path.open("w", newline="", encoding="utf-8-sig") as stream:
+        fieldnames = ["Reason", "Id", "Name", "Release_Date", "Province",
+                      "City", "Candidate_Source_Keys", "Match_Methods"]
+        writer = csv.DictWriter(stream, fieldnames=fieldnames, lineterminator="\r\n")
+        writer.writeheader()
+        writer.writerows(review_rows)
+    report["review_rows"] = len(review_rows)
+    report["review_csv"] = str(review_path)
     return report
+
+
+LEGACY_FIELD_FALLBACKS = {
+    "Full_Title__c": "Name",
+    "Buyer_Name__c": "accountname__c",
+    "Winner_Name__c": "bidwinningname__c",
+    "Source_Budget__c": "budget__c",
+    "Source_Winning_Wan__c": "bidwinningamount__c",
+    "Announcement_Url_Full__c": "website__c",
+}
+
+
+def prepare_legacy_field_backfill(target_org: str, output: Path) -> dict:
+    """Prepare, but never execute, old-to-new field fallback updates."""
+    selected = ["Id", *LEGACY_FIELD_FALLBACKS.keys(),
+                *LEGACY_FIELD_FALLBACKS.values()]
+    rows = sf_query_all(target_org, "SELECT " + ",".join(selected) + " FROM bidnews__c")
+    updates = []
+    counts = Counter()
+    for row in rows:
+        result = {"Id": str(row.get("Id") or "")}
+        changed = False
+        for new_field, old_field in LEGACY_FIELD_FALLBACKS.items():
+            new_value = row.get(new_field)
+            old_value = row.get(old_field)
+            if (new_value is None or str(new_value).strip() == "") and \
+                    old_value is not None and str(old_value).strip() != "":
+                result[new_field] = old_value
+                counts[new_field] += 1
+                changed = True
+            else:
+                # Preserve existing new-field values; blank CSV cells can clear
+                # fields in Bulk API updates.
+                result[new_field] = "" if new_value is None else new_value
+        if changed:
+            updates.append(result)
+    path = output / "production_legacy_field_backfill.csv"
+    with path.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream,
+                                fieldnames=["Id", *LEGACY_FIELD_FALLBACKS.keys()],
+                                lineterminator="\r\n")
+        writer.writeheader()
+        writer.writerows(updates)
+    return {
+        "remote_rows_scanned": len(rows),
+        "rows_to_update": len(updates),
+        "field_fill_counts": dict(counts),
+        "backfill_csv": str(path),
+        "executed": False,
+    }
 
 
 def dry_run(base: Path = DEFAULT_BASE, target_org: str = "sfoa-prod",
@@ -264,13 +433,13 @@ def dry_run(base: Path = DEFAULT_BASE, target_org: str = "sfoa-prod",
         if report["warnings"]:
             raise RuntimeError("导入预检查存在异常：" +
                                json.dumps(report["warnings"], ensure_ascii=False))
-        csv_path = output / "bidnews_upsert.csv"
-        with csv_path.open(newline="", encoding="utf-8") as stream:
+        csv_path = upload_csv(output, target_org)
+        with csv_path.open(newline="", encoding="utf-8-sig") as stream:
             local_rows = list(csv.DictReader(stream))
         local_keys = [row["Source_Key__c"] for row in local_rows]
         description = sf_rest(
             target_org, f"/services/data/v{BULK_API_VERSION}/sobjects/bidnews__c/describe")
-        schema = assess_target_schema(description)
+        schema = assess_target_schema(description, upload_fields(target_org))
         schema_ok = (
             schema["object"] == "bidnews__c"
             and not schema["missing_fields"]
@@ -298,13 +467,28 @@ def dry_run(base: Path = DEFAULT_BASE, target_org: str = "sfoa-prod",
                 f"/services/data/v{BULK_API_VERSION}/query?q=" +
                 quote("SELECT COUNT() FROM bidnews__c WHERE Source_Key__c = null", safe="")
             ).get("totalSize", 0)
-            comparison = compare_external_ids(local_keys, remote_keys, int(without_key))
+            comparison = compare_external_ids(
+                local_keys, remote_keys, int(without_key),
+                ignore_remote_without_key=(target_org == "sfoa-prod"))
+            if target_org == "sfoa-prod":
+                comparison["legacy_policy"] = "block_overlapping_legacy_rows"
+                legacy_rows = sf_query_all(target_org,
+                    "SELECT Id,Name,Full_Title__c,Buyer_Name__c,accountname__c,"
+                    "release_date__c FROM bidnews__c WHERE Source_Key__c = null"
+                ) if without_key else []
+                overlaps = legacy_overlap_count(local_rows, legacy_rows)
+                comparison["legacy_overlap_rows"] = overlaps
+                if overlaps:
+                    comparison["safe_to_upsert"] = False
+                    comparison["reason"] = "存在无外部键的疑似重复历史标讯，需先核实处理"
         safe = schema_ok and comparison["safe_to_upsert"]
         result = {
             "status": "ready" if safe else "blocked",
             "target_org": target_org,
             "files": len(pending),
             "rows": report["rows_written"],
+            "blocked_rows": report.get("blocked_rows", 0),
+            "blocked_rows_file": report.get("blocked_rows_file"),
             "duplicates_in_batch": report["duplicates_skipped"],
             "categories_skipped": report["categories_skipped"],
             "schema": schema,
@@ -385,7 +569,7 @@ def find_recent_bulk_job(target_org: str, started_at: datetime,
 def verify_recent_upsert(csv_path: Path, target_org: str, started_at: datetime,
                          expected_rows: int) -> bool:
     """Confirm every external ID was modified by this run if Bulk CLI loses its JSON."""
-    with csv_path.open(newline="", encoding="utf-8") as stream:
+    with csv_path.open(newline="", encoding="utf-8-sig") as stream:
         keys = [row["Source_Key__c"] for row in csv.DictReader(stream)]
     if (len(keys) != expected_rows or len(set(keys)) != expected_rows
             or not all(re.fullmatch(r"[0-9a-f]{64}", key) for key in keys)):
@@ -450,9 +634,82 @@ def _pending_files(base: Path, force: bool = False,
                 if manifest_path.exists() else {"version": 1, "files": {}})
     files = sorted(p for p in source.rglob("*.xlsx") if not p.name.startswith("~$"))
     hashes = {str(p.resolve()): digest(p) for p in files}
-    pending = [p for p in files if force or
-               manifest["files"].get(str(p.resolve())) != hashes[str(p.resolve())]]
+    # Reviewed history is a separate ledger, not a claim that every row uploaded.
+    # Changed files are always reconsidered; --force still includes all files.
+    reviewed = manifest.get("reviewed_files", {}) if target_org == "sfoa-prod" else {}
+    pending = [p for p in files if force or (
+               manifest["files"].get(str(p.resolve())) != hashes[str(p.resolve())]
+               and reviewed.get(str(p.resolve())) != hashes[str(p.resolve())])]
     return output, manifest_path, manifest, pending, hashes
+
+
+def _read_blocked_rows(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    # Quarantine CSVs retain complete announcement bodies, which can exceed
+    # Python csv's default 128 KiB per-field parsing limit.
+    csv.field_size_limit(max(csv.field_size_limit(), 16 * 1024 * 1024))
+    with path.open(newline="", encoding="utf-8") as stream:
+        return list(csv.DictReader(stream))
+
+
+def _merge_blocked_queue(queue_path: Path, run_path: Path,
+                         processed_files: list[Path]) -> int:
+    """Keep full oversized rows locally, replacing entries for rescanned files."""
+    processed = {os.path.normcase(str(path.resolve())) for path in processed_files}
+    rows_by_source: dict[tuple[str, str], dict] = {}
+    for row in _read_blocked_rows(queue_path):
+        source_path = os.path.normcase(str(Path(row.get("Source_File_Path") or "").resolve()))
+        if source_path not in processed:
+            key = (source_path, str(row.get("Source_Row_Number__c") or ""))
+            rows_by_source[key] = row
+    for row in _read_blocked_rows(run_path):
+        source_path = os.path.normcase(str(Path(row.get("Source_File_Path") or "").resolve()))
+        key = (source_path, str(row.get("Source_Row_Number__c") or ""))
+        rows_by_source[key] = row
+
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = queue_path.with_suffix(queue_path.suffix + ".tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=BLOCKED_FIELDS,
+                                lineterminator="\r\n", extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows_by_source.values())
+    temporary.replace(queue_path)
+    return len(rows_by_source)
+
+
+def _blocked_queue_count(path: Path) -> int:
+    return len(_read_blocked_rows(path))
+
+
+def initialize_production_cutover(base: Path = DEFAULT_BASE,
+                                  target_org: str = "sfoa-prod") -> dict:
+    """Mark current local workbooks as legacy without uploading them."""
+    if target_org != "sfoa-prod":
+        raise ValueError("历史数据切点仅用于 sfoa-prod")
+    base = base.resolve()
+    _, manifest_path, manifest, _, hashes = _pending_files(
+        base, target_org=target_org)
+    existing = manifest.get("files") or {}
+    if existing:
+        if existing == hashes:
+            return {"status": "unchanged", "target_org": target_org,
+                    "legacy_files_ignored": len(existing),
+                    "manifest": str(manifest_path)}
+        raise RuntimeError("生产同步清单已经存在，禁止覆盖已有进度")
+    now = datetime.now(timezone.utc).isoformat()
+    initialized = {
+        "version": 1,
+        "files": hashes,
+        "cutover_policy": "ignore_existing_files_and_upload_future_files_only",
+        "cutover_initialized_at": now,
+    }
+    _write_manifest(manifest_path, initialized)
+    return {"status": "initialized", "target_org": target_org,
+            "legacy_files_ignored": len(hashes),
+            "future_files_receive_source_key": True,
+            "manifest": str(manifest_path)}
 
 
 @contextmanager
@@ -497,20 +754,28 @@ def sync(base: Path = DEFAULT_BASE, target_org: str = "zihao", force: bool = Fal
         output, manifest_path, manifest, pending, hashes = _pending_files(
             base, force, target_org)
         if not pending:
-            return {"status": "unchanged", "files": 0, "rows": 0,
-                    "target_org": target_org,
+            queue_path = output / "blocked_rows_pending.csv"
+            blocked_count = _blocked_queue_count(queue_path)
+            return {"status": "blocked_pending" if blocked_count else "unchanged",
+                    "files": 0, "rows": 0, "target_org": target_org,
                     "environment": "生产" if target_org == "sfoa-prod" else "沙盒",
                     "successful_rows": 0, "failed_rows": 0,
+                    "blocked_rows": blocked_count,
+                    "blocked_rows_file": str(queue_path) if blocked_count else None,
                     "inserted_rows": 0, "updated_rows": 0,
                     "duplicates_filtered": 0, "categories_filtered": 0}
-        report = prepare(base / "downloads", output, selected_files=pending)
+        run_blocked_path = output / "blocked_rows_run.csv"
+        report = prepare(base / "downloads", output, selected_files=pending,
+                         blocked_output=run_blocked_path)
         if report["warnings"]:
             raise RuntimeError("导入预检查存在异常，未上传：" + json.dumps(report["warnings"], ensure_ascii=False))
+        queue_path = output / "blocked_rows_pending.csv"
+        blocked_count = _merge_blocked_queue(queue_path, run_blocked_path, pending)
+        csv_path = upload_csv(output, target_org)
         if report["rows_written"]:
             # Count inserts and updates before the upsert. Source_Key__c is unique,
             # so this read-only comparison is exact for this batch.
-            with (output / "bidnews_upsert.csv").open(
-                    newline="", encoding="utf-8") as stream:
+            with csv_path.open(newline="", encoding="utf-8-sig") as stream:
                 local_keys = [row["Source_Key__c"] for row in csv.DictReader(stream)]
             remote_records = sf_query_all(
                 target_org,
@@ -526,7 +791,7 @@ def sync(base: Path = DEFAULT_BASE, target_org: str = "zihao", force: bool = Fal
                 "--target-org", target_org,
                 "--sobject", "bidnews__c",
                 "--external-id", "Source_Key__c",
-                "--file", str((output / "bidnews_upsert.csv").resolve()),
+                "--file", str(csv_path.resolve()),
                 "--line-ending", "CRLF", "--wait", "10", "--json",
             ]
             started_at = datetime.now(timezone.utc)
@@ -545,7 +810,7 @@ def sync(base: Path = DEFAULT_BASE, target_org: str = "zihao", force: bool = Fal
                     job_id = job["id"]
                     reconciliation_method = "bulk_job_rest_lookup"
                 except RuntimeError as lookup_error:
-                    if not verify_recent_upsert(output / "bidnews_upsert.csv", target_org,
+                    if not verify_recent_upsert(csv_path, target_org,
                                                 started_at, report["rows_written"]):
                         raise RuntimeError(
                             "Salesforce CLI 未返回 JSON，且 REST Job 与外部键核验均失败；"
@@ -583,11 +848,15 @@ def sync(base: Path = DEFAULT_BASE, target_org: str = "zihao", force: bool = Fal
                 "verified_at": manifest["last_synced_at"],
             }
         _write_manifest(manifest_path, manifest)
-        return {"status": "uploaded", "files": len(pending),
+        return {"status": "uploaded_with_blocked" if blocked_count else "uploaded",
+                "files": len(pending),
                 "rows": report["rows_written"], "job_id": job_id,
                 "target_org": target_org,
                 "environment": "生产" if target_org == "sfoa-prod" else "沙盒",
                 "successful_rows": report["rows_written"], "failed_rows": 0,
+                "blocked_rows": blocked_count,
+                "newly_blocked_rows": report.get("blocked_rows", 0),
+                "blocked_rows_file": str(queue_path) if blocked_count else None,
                 "inserted_rows": inserted_rows, "updated_rows": updated_rows,
                 "verified_without_cli_result": verified_without_cli_result,
                 "duplicates_in_batch": report["duplicates_skipped"],
@@ -608,11 +877,15 @@ def reconcile(base: Path, target_org: str, job_id: str) -> dict:
         if not pending:
             return {"status": "unchanged", "files": 0, "rows": 0,
                     "job_id": manifest.get("last_job_id")}
-        report = prepare(base / "downloads", output, selected_files=pending)
+        run_blocked_path = output / "blocked_rows_run.csv"
+        report = prepare(base / "downloads", output, selected_files=pending,
+                         blocked_output=run_blocked_path)
         if report["warnings"]:
             raise RuntimeError("恢复预检查存在异常：" +
                                json.dumps(report["warnings"], ensure_ascii=False))
         job = validate_bulk_job(get_bulk_job(target_org, job_id), report["rows_written"])
+        queue_path = output / "blocked_rows_pending.csv"
+        blocked_count = _merge_blocked_queue(queue_path, run_blocked_path, pending)
         for path in pending:
             manifest["files"][str(path.resolve())] = hashes[str(path.resolve())]
         now = datetime.now(timezone.utc).isoformat()
@@ -624,9 +897,12 @@ def reconcile(base: Path, target_org: str, job_id: str) -> dict:
             "verified_at": now,
         }
         _write_manifest(manifest_path, manifest)
-        return {"status": "reconciled", "files": len(pending),
+        return {"status": "reconciled_with_blocked" if blocked_count else "reconciled",
+                "files": len(pending),
                 "rows": report["rows_written"], "job_id": job["id"],
-                "failed": int(job["numberRecordsFailed"])}
+                "failed": int(job["numberRecordsFailed"]),
+                "blocked_rows": blocked_count,
+                "blocked_rows_file": str(queue_path) if blocked_count else None}
 
 
 if __name__ == "__main__":
@@ -637,10 +913,16 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true",
                         help="只读核对字段和外部键，统计新增/更新条数，不上传")
     parser.add_argument("--reconcile-job", help="核验已完成的 Bulk Job 并恢复未推进的本地同步清单")
+    parser.add_argument("--initialize-production-cutover", action="store_true",
+                        help="把当前本地 Excel 标记为历史数据，只上传以后新增的文件")
     args = parser.parse_args()
-    if args.dry_run and args.reconcile_job:
-        parser.error("--dry-run 与 --reconcile-job 不能同时使用")
-    action = (dry_run(args.base, args.target_org, args.force) if args.dry_run else
+    selected = sum(bool(value) for value in (
+        args.dry_run, args.reconcile_job, args.initialize_production_cutover))
+    if selected > 1:
+        parser.error("--dry-run、--reconcile-job 与 --initialize-production-cutover 不能同时使用")
+    action = (initialize_production_cutover(args.base, args.target_org)
+              if args.initialize_production_cutover else
+              dry_run(args.base, args.target_org, args.force) if args.dry_run else
               reconcile(args.base, args.target_org, args.reconcile_job)
               if args.reconcile_job else sync(args.base, args.target_org, args.force))
     print(json.dumps(action, ensure_ascii=False, indent=2))

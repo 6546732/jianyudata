@@ -5,6 +5,7 @@ notebook_chrome/
 browser_profile/
 downloads/
 sfoa_upload/
+sfoa_upload_*/
 *.log
 run.lock
 one_day_*.json
@@ -23,3 +24,9 @@ range_progress.json
 daily_scheduler.lock
 backup-*/
 *.backup-*
+search-deploy-result.json
+search-smoke-result.json
+buyer-deploy-result.json
+hospital-diagnostic-result.json
+.sf/
+.sfdx/

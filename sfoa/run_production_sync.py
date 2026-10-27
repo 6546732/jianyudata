@@ -24,6 +24,11 @@ def main(force=False):
     error = ""
     preflight = None
     try:
+        # The runtime parent supplies the same coordination used by sandbox.
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from scheduled_task_coordination import DOWNLOAD_TASK, UPLOAD_TASK, wait_for_tasks
+        wait_for_tasks((DOWNLOAD_TASK, UPLOAD_TASK))
         preflight = dry_run(BASE, "sfoa-prod", force)
         if not preflight.get("safe_to_execute"):
             raise RuntimeError("生产预演未通过，已阻止写入")
@@ -32,17 +37,28 @@ def main(force=False):
     except Exception:
         error = traceback.format_exc()
     details = result or {}
-    success = details.get("status") in {"uploaded", "unchanged", "reconciled"}
+    success = details.get("status") in {
+        "uploaded", "uploaded_with_blocked", "blocked_pending",
+        "unchanged", "reconciled", "reconciled_with_blocked"
+    }
+    blocked_rows = int(details.get("blocked_rows") or
+                       (preflight or {}).get("blocked_rows") or 0)
+    summary_status = ("失败" if not success else
+                      "有待处理记录" if details.get("status") == "blocked_pending" else
+                      "部分成功" if blocked_rows else "成功")
     summary = {
         "run_started_at": started.isoformat(),
         "run_finished_at": datetime.now().isoformat(),
         "target_org": "sfoa-prod",
         "environment": "生产",
-        "status": "成功" if success else "失败",
+        "status": summary_status,
         "attempted_rows": int((preflight or {}).get("rows") or 0),
         "uploaded_rows": int(details.get("rows") or 0) if success else 0,
         "successful_rows": int(details.get("successful_rows", details.get("rows", 0)) or 0) if success else 0,
-        "failed_rows": int(details.get("failed_rows") or 0) if success else int((preflight or {}).get("rows") or 0),
+        "failed_rows": int(details.get("failed_rows") or 0),
+        "blocked_rows": blocked_rows,
+        "blocked_rows_file": details.get("blocked_rows_file") or
+                             (preflight or {}).get("blocked_rows_file"),
         "inserted_rows": details.get("inserted_rows"),
         "updated_rows": details.get("updated_rows"),
         "duplicates_filtered": count_value(details.get("duplicates_filtered", (preflight or {}).get("duplicates_in_batch", 0))),

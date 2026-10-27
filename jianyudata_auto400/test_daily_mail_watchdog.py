@@ -33,12 +33,26 @@ class DailyMailWatchdogTest(unittest.TestCase):
             "duplicates_filtered": 19, "categories_filtered": 51, "job_id": "750"})
         with patch.object(watchdog, "LOGS", self.logs):
             subject, body, success = watchdog.combined_report(self.day)
-        self.assertTrue(success)
+        self.assertFalse(success)
         self.assertIn("[沙盒（生产未执行）]", subject)
         self.assertIn("2025-05-20 至 2025-05-22", body)
         self.assertIn("插入：174 条", body)
         self.assertIn("更新：618 条", body)
-        self.assertIn("生产 sfoa-prod：今日未执行", body)
+        self.assertIn("生产 sfoa-prod：未生成汇总（异常）", body)
+        self.write("salesforce-production-20261010-111000-summary.json", {
+            "run_started_at": self.day + "T11:10:00", "status": "失败",
+            "successful_rows": 0, "failure_reason": "认证过期"})
+        with patch.object(watchdog, "LOGS", self.logs):
+            subject, body, success = watchdog.combined_report(self.day)
+        self.assertFalse(success)
+        self.assertIn("认证过期", body)
+        self.write("salesforce-production-20261010-111000-summary.json", {
+            "run_started_at": self.day + "T11:10:00", "status": "成功",
+            "successful_rows": 100})
+        with patch.object(watchdog, "LOGS", self.logs):
+            subject, body, success = watchdog.combined_report(self.day)
+        self.assertTrue(success)
+        self.assertIn("生产上传100条", subject)
 
 
 if __name__ == "__main__":

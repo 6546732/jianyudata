@@ -35,6 +35,18 @@ class SalesforceSyncRunnerTest(unittest.TestCase):
         self.assertEqual(summary['categories_filtered'], 5)
         self.assertEqual(summary['duplicates_filtered'], 1)
 
+    def test_partial_upload_reports_quarantined_oversized_rows(self):
+        with patch.object(runner, 'BASE', self.base):
+            summary = runner.build_summary(self.started, {
+                'status': 'uploaded_with_blocked', 'rows': 789,
+                'blocked_rows': 1,
+                'blocked_rows_file': 'D:\\data\\sfoa_upload\\blocked_rows_pending.csv',
+            })
+        self.assertEqual(summary['status'], '部分成功')
+        self.assertEqual(summary['uploaded_rows'], 789)
+        self.assertEqual(summary['blocked_rows'], 1)
+        self.assertIn('完整原文队列', runner.summary_text(summary))
+
     def test_failure_reports_zero_uploaded_and_reason(self):
         with patch.object(runner, 'BASE', self.base):
             summary = runner.build_summary(

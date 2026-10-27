@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from run_scheduled_notebook import _failure_reason, _read_json
+from scheduled_task_coordination import DOWNLOAD_TASK, wait_for_tasks
 
 ROOT = Path(__file__).resolve().parent
 BASE = Path(r'D:\桌面\data')
@@ -23,21 +24,30 @@ def build_summary(started_at, result=None, error_text=''):
     report_is_current = (report_path.exists()
                          and report_path.stat().st_mtime >= started_at.timestamp())
     success = isinstance(result, dict) and result.get('status') in {
-        'uploaded', 'unchanged', 'reconciled'
+        'uploaded', 'uploaded_with_blocked', 'blocked_pending',
+        'unchanged', 'reconciled', 'reconciled_with_blocked'
     }
     details = result or {}
+    blocked_rows = int(details.get('blocked_rows') or
+                       (report.get('blocked_rows') if report_is_current else 0) or 0)
+    summary_status = ('失败' if not success else
+                      '有待处理记录' if details.get('status') == 'blocked_pending' else
+                      '部分成功' if blocked_rows else '成功')
     return {
         'run_started_at': started_at.isoformat(),
         'run_finished_at': datetime.now().isoformat(),
         'target_org': details.get('target_org', 'zihao'),
         'environment': details.get('environment', '沙盒'),
-        'status': '成功' if success else '失败',
+        'status': summary_status,
         'source_files': int(report.get('source_files') or 0) if report_is_current else None,
         'rows_read': int(report.get('rows_read') or 0) if report_is_current else None,
         'attempted_rows': int(report.get('rows_written') or 0) if report_is_current else None,
         'uploaded_rows': int((result or {}).get('rows') or 0) if success else 0,
         'successful_rows': int(details.get('successful_rows', details.get('rows', 0)) or 0) if success else 0,
         'failed_rows': int(details.get('failed_rows') or 0),
+        'blocked_rows': blocked_rows,
+        'blocked_rows_file': details.get('blocked_rows_file') or
+                             (report.get('blocked_rows_file') if report_is_current else None),
         'inserted_rows': details.get('inserted_rows'),
         'updated_rows': details.get('updated_rows'),
         'duplicates_filtered': _count(details.get('duplicates_filtered', details.get('duplicates_in_batch', 0))),
@@ -63,6 +73,10 @@ def summary_text(summary):
         lines.append(f"去重后待上传/尝试：{summary['attempted_rows']} 条")
     if summary['job_id']:
         lines.append(f"Salesforce Job：{summary['job_id']}")
+    if summary.get('blocked_rows'):
+        lines.append(f"超长正文隔离待处理：{summary['blocked_rows']} 条")
+        if summary.get('blocked_rows_file'):
+            lines.append(f"完整原文队列：{summary['blocked_rows_file']}")
     if summary['failure_reason']:
         lines.extend(['', '失败原因：', summary['failure_reason']])
     lines.extend(['', '上传失败时同步清单不会推进；下次任务会按外部唯一键安全重试。'])
@@ -80,6 +94,8 @@ def main():
             contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
         print('Salesforce 独立上传启动：', started_at.isoformat(), flush=True)
         try:
+            states = wait_for_tasks((DOWNLOAD_TASK,))
+            print('下载任务协调完成：', states, flush=True)
             sfoa_directory = ROOT.parent / 'sfoa'
             if not sfoa_directory.is_dir():
                 sfoa_directory = ROOT / 'sfoa'
