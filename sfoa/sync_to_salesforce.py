@@ -9,10 +9,12 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import os
 import re
 import subprocess
+import tempfile
 import time
 from collections import Counter
 from contextlib import contextmanager
@@ -73,7 +75,7 @@ def upload_csv(output: Path, target_org: str) -> Path:
         return source
     destination = output / "bidnews_upsert_production.csv"
     with source.open(newline="", encoding="utf-8") as input_stream, \
-            destination.open("w", newline="", encoding="utf-8-sig") as output_stream:
+            destination.open("w", newline="", encoding="utf-8") as output_stream:
         reader = csv.DictReader(input_stream)
         writer = csv.DictWriter(output_stream,
                                 fieldnames=list(PRODUCTION_FIELD_MAP.values()),
@@ -95,6 +97,63 @@ def upload_csv(output: Path, target_org: str) -> Path:
                 converted[target] = format(rounded, "f")
             writer.writerow(converted)
     return destination
+
+
+def split_csv_by_size(source: Path, directory: Path,
+                      max_bytes: int = 120_000_000) -> list[tuple[Path, int]]:
+    """Split CSV into UTF-8 files below Salesforce's 150 MB ingest limit."""
+    csv.field_size_limit(max(csv.field_size_limit(), 16 * 1024 * 1024))
+    chunks: list[tuple[Path, int]] = []
+    buffer = io.StringIO(newline="")
+    row_writer = csv.writer(buffer, lineterminator="\r\n")
+    current_stream = None
+    current_path: Path | None = None
+    current_size = 0
+    current_rows = 0
+
+    def close_chunk() -> None:
+        nonlocal current_stream, current_path, current_size, current_rows
+        if current_stream is not None:
+            current_stream.close()
+            assert current_path is not None
+            chunks.append((current_path, current_rows))
+        current_stream = None
+        current_path = None
+        current_size = 0
+        current_rows = 0
+
+    with source.open(newline="", encoding="utf-8-sig") as stream:
+        reader = csv.reader(stream)
+        try:
+            header = next(reader)
+        except StopIteration:
+            return []
+        buffer.seek(0)
+        buffer.truncate(0)
+        row_writer.writerow(header)
+        header_bytes = buffer.getvalue().encode("utf-8")
+        if len(header_bytes) > max_bytes:
+            raise ValueError("CSV 表头超过单片大小上限")
+
+        for row in reader:
+            buffer.seek(0)
+            buffer.truncate(0)
+            row_writer.writerow(row)
+            row_bytes = buffer.getvalue().encode("utf-8")
+            if len(header_bytes) + len(row_bytes) > max_bytes:
+                raise ValueError(
+                    f"单条标讯超过分片大小上限：{len(row_bytes)} 字节")
+            if current_stream is None or current_size + len(row_bytes) > max_bytes:
+                close_chunk()
+                current_path = directory / f"bidnews_upsert_part_{len(chunks) + 1:03}.csv"
+                current_stream = current_path.open("wb")
+                current_stream.write(header_bytes)
+                current_size = len(header_bytes)
+            current_stream.write(row_bytes)
+            current_size += len(row_bytes)
+            current_rows += 1
+        close_chunk()
+    return chunks
 
 
 def _sf_environment() -> dict:
@@ -521,7 +580,8 @@ def validate_bulk_job(job: dict, expected_rows: int) -> dict:
             "Salesforce Bulk Job 未通过核验："
             f"job={job.get('id')} object={job.get('object')} "
             f"operation={job.get('operation')} state={job.get('state')} "
-            f"processed={processed}/{expected_rows} failed={failed}")
+            f"processed={processed}/{expected_rows} failed={failed} "
+            f"error={job.get('errorMessage') or ''}")
     return job
 
 
@@ -530,8 +590,24 @@ def get_bulk_job(target_org: str, job_id: str) -> dict:
     return sf_rest(target_org, endpoint)
 
 
+def wait_for_bulk_job(target_org: str, job_id: str,
+                      expected_rows: int, attempts: int = 90) -> dict:
+    """Poll a known Bulk Job until it reaches a verifiable terminal state."""
+    last_job = {}
+    for attempt in range(attempts):
+        last_job = get_bulk_job(target_org, job_id)
+        if last_job.get("state") not in {"Open", "UploadComplete", "InProgress"}:
+            return validate_bulk_job(last_job, expected_rows)
+        if attempt + 1 < attempts:
+            time.sleep(10)
+    raise TimeoutError(
+        f"等待 Salesforce Bulk Job 超时：job={job_id} "
+        f"state={last_job.get('state')} processed="
+        f"{last_job.get('numberRecordsProcessed', -1)}/{expected_rows}")
+
+
 def find_recent_bulk_job(target_org: str, started_at: datetime,
-                         expected_rows: int, attempts: int = 6) -> dict:
+                         expected_rows: int, attempts: int = 90) -> dict:
     """Find the job created by this run when the upsert command loses stdout."""
     endpoint = f"/services/data/v{BULK_API_VERSION}/jobs/ingest"
     last_error: Exception | None = None
@@ -554,7 +630,8 @@ def find_recent_bulk_job(target_org: str, started_at: datetime,
                 detail = get_bulk_job(target_org, summary["id"])
                 if detail.get("state") in {"Open", "UploadComplete", "InProgress"}:
                     continue
-                if int(detail.get("numberRecordsProcessed", -1)) == expected_rows:
+                if (int(detail.get("numberRecordsProcessed", -1)) == expected_rows
+                        or detail.get("state") != "JobComplete"):
                     return validate_bulk_job(detail, expected_rows)
         except (RuntimeError, subprocess.SubprocessError) as error:
             last_error = error
@@ -786,52 +863,59 @@ def sync(base: Path = DEFAULT_BASE, target_org: str = "zihao", force: bool = Fal
             updated_rows = len(local_keys) - inserted_rows
             # 在创建写入型 Bulk Job 前确认认证和网络可用；预检只读且可安全重试。
             sf_rest(target_org, f"/services/data/v{BULK_API_VERSION}/limits")
-            command = [
-                str(NODE), str(SF_CLI), "data", "upsert", "bulk",
-                "--target-org", target_org,
-                "--sobject", "bidnews__c",
-                "--external-id", "Source_Key__c",
-                "--file", str(csv_path.resolve()),
-                "--line-ending", "CRLF", "--wait", "10", "--json",
-            ]
-            started_at = datetime.now(timezone.utc)
-            process = subprocess.run(
-                command, capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=900, env=_sf_environment(),
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
+            job_ids: list[str | None] = []
             verified_without_cli_result = False
-            try:
-                result = json.loads(process.stdout)
-            except json.JSONDecodeError as error:
-                try:
-                    job = find_recent_bulk_job(target_org, started_at,
-                                               report["rows_written"])
-                    job_id = job["id"]
-                    reconciliation_method = "bulk_job_rest_lookup"
-                except RuntimeError as lookup_error:
-                    if not verify_recent_upsert(csv_path, target_org,
-                                                started_at, report["rows_written"]):
-                        raise RuntimeError(
-                            "Salesforce CLI 未返回 JSON，且 REST Job 与外部键核验均失败；"
-                            f"exit={process.returncode} stderr_chars={len(process.stderr)}；"
-                            f"REST={lookup_error}；未推进同步进度") from error
-                    job_id = None
-                    reconciliation_method = "all_external_ids_modified_after_bulk_submit"
-                verified_without_cli_result = True
-            else:
-                job = (result.get("result") or {}).get("jobInfo") or {}
-                processed = int(job.get("numberRecordsProcessed", -1))
-                failed = int(job.get("numberRecordsFailed", -1))
-                if (process.returncode or result.get("status") != 0
-                        or job.get("state") != "JobComplete"
-                        or processed != report["rows_written"] or failed != 0):
-                    raise RuntimeError(
-                        f"Salesforce 批量上传未通过核验：job={job.get('id')} "
-                        f"state={job.get('state')} processed={processed} failed={failed}；"
-                        "未推进同步进度，请检查 Bulk Job"
+            reconciliation_method = "bulk_job_rest_lookup"
+            with tempfile.TemporaryDirectory(
+                    prefix="jianyu-prod-upsert-", dir=output) as chunk_directory:
+                if target_org == "sfoa-prod":
+                    chunks = split_csv_by_size(csv_path, Path(chunk_directory))
+                else:
+                    chunks = [(csv_path, report["rows_written"])]
+                if sum(row_count for _, row_count in chunks) != report["rows_written"]:
+                    raise RuntimeError("CSV 分片条数与本批记录数不一致，已取消上传")
+                for chunk_path, expected_rows in chunks:
+                    command = [
+                        str(NODE), str(SF_CLI), "data", "upsert", "bulk",
+                        "--target-org", target_org,
+                        "--sobject", "bidnews__c",
+                        "--external-id", "Source_Key__c",
+                        "--file", str(chunk_path.resolve()),
+                        "--line-ending", "CRLF", "--wait", "10", "--json",
+                    ]
+                    started_at = datetime.now(timezone.utc)
+                    process = subprocess.run(
+                        command, capture_output=True, text=True, encoding="utf-8",
+                        errors="replace", timeout=900, env=_sf_environment(),
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     )
-                job_id = job["id"]
+                    result = {}
+                    try:
+                        result = json.loads(process.stdout)
+                    except json.JSONDecodeError:
+                        pass
+                    cli_job = (result.get("result") or {}).get("jobInfo") or {}
+                    if cli_job.get("id"):
+                        job = wait_for_bulk_job(
+                            target_org, cli_job["id"], expected_rows)
+                    else:
+                        try:
+                            job = find_recent_bulk_job(target_org, started_at,
+                                                       expected_rows)
+                        except RuntimeError as lookup_error:
+                            if not verify_recent_upsert(chunk_path, target_org,
+                                                        started_at, expected_rows):
+                                raise RuntimeError(
+                                    "Salesforce 批次未完成核验；"
+                                    f"CLI exit={process.returncode} "
+                                    f"stderr_chars={len(process.stderr)}；"
+                                    f"REST={lookup_error}；未推进同步进度") from lookup_error
+                            job = {"id": None}
+                            reconciliation_method = (
+                                "all_external_ids_modified_after_bulk_submit")
+                        verified_without_cli_result = True
+                    job_ids.append(job.get("id"))
+            job_id = next((value for value in reversed(job_ids) if value), None)
         else:
             job_id = None
             verified_without_cli_result = False
@@ -845,12 +929,14 @@ def sync(base: Path = DEFAULT_BASE, target_org: str = "zihao", force: bool = Fal
             manifest["last_reconciliation"] = {
                 "method": reconciliation_method,
                 "files": len(pending), "rows": report["rows_written"],
+                "job_ids": job_ids,
                 "verified_at": manifest["last_synced_at"],
             }
         _write_manifest(manifest_path, manifest)
         return {"status": "uploaded_with_blocked" if blocked_count else "uploaded",
                 "files": len(pending),
                 "rows": report["rows_written"], "job_id": job_id,
+                "job_ids": job_ids if report["rows_written"] else [],
                 "target_org": target_org,
                 "environment": "生产" if target_org == "sfoa-prod" else "沙盒",
                 "successful_rows": report["rows_written"], "failed_rows": 0,
